@@ -1,204 +1,1576 @@
+"""
+AutoPDF-compress (改良版)
+原專案: https://github.com/eason9709/AutoPDF-compress (README 聲明為 MIT 授權)
+
+功能
+- 壓縮 PDF, 並可把 PNG / JPG / WEBP / BMP / TIFF (以及 HEIC / HEIF, 需 pillow-heif) 轉成 PDF
+- 合併: 清單中的 PDF 與圖片可依序接成一個 PDF; 拆分: 每個 PDF 依頁數切成多個檔案
+- 每個 PDF 可單獨指定頁碼範圍, 例如 1-3,5,8-
+- 拖曳檔案/資料夾進視窗
+- 多語言: 讀取 lang/ 資料夾內的 .json, 檔案有幾個就有幾種語言可選 (exe 亦適用)
+- 自動模式: 設定目標大小, 程式用二分搜尋 JPEG 品質逼近目標, 不夠才降解析度
+- 不需要 Poppler: 使用 pypdfium2 渲染, pip 即可安裝
+- 記住上次的所有設定 (輸出資料夾、DPI、模式、主題…)
+- 淺色 / 深色 / 跟隨系統 三種外觀
+
+注意: 輸出是「圖片式 PDF」, 原本可選取/搜尋的文字會消失。
+"""
+
+import io
+import json
+import math
 import os
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from pdf2image import convert_from_path
-from PIL import Image
+import queue
+import subprocess
+import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
-class PDFCompressorGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("PDF 壓縮工具")
-        self.root.geometry("600x700")
-        
-        # 主框架
-        main_frame = ttk.Frame(root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # 檔案選擇區域
-        file_frame = ttk.LabelFrame(main_frame, text="PDF檔案選擇", padding="5")
-        file_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # 檔案列表
-        self.file_listbox = tk.Listbox(file_frame, height=10)
-        self.file_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # 檔案操作按鈕
-        btn_frame = ttk.Frame(file_frame)
-        btn_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(btn_frame, text="添加檔案", command=self.add_files).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="清除所有", command=self.clear_files).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="移除選中", command=self.remove_selected).pack(side=tk.LEFT, padx=5)
-        
-        # 設定區域
-        settings_frame = ttk.LabelFrame(main_frame, text="設定", padding="5")
-        settings_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        # 輸出資料夾
-        output_frame = ttk.Frame(settings_frame)
-        output_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(output_frame, text="輸出資料夾:").pack(side=tk.LEFT)
-        self.output_path = tk.StringVar()
-        ttk.Entry(output_frame, textvariable=self.output_path).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        ttk.Button(output_frame, text="瀏覽", command=self.browse_output).pack(side=tk.LEFT)
-        
-        # DPI 設定
-        dpi_frame = ttk.Frame(settings_frame)
-        dpi_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(dpi_frame, text="DPI 設定:").pack(side=tk.LEFT)
-        self.dpi = tk.IntVar(value=200)  # 預設 DPI
-        dpi_scale = ttk.Scale(dpi_frame, from_=72, to=300, variable=self.dpi, orient=tk.HORIZONTAL)
-        dpi_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        self.dpi_label = ttk.Label(dpi_frame, text="200")
-        self.dpi_label.pack(side=tk.LEFT, padx=5)
-        dpi_scale.configure(command=self.update_dpi_label)
-        
-        # 目標檔案大小
-        self.target_size = 4 * 1024  # 4MB in KB
-        
-        # 自動模式選項
-        self.auto_mode = tk.BooleanVar()
-        ttk.Checkbutton(settings_frame, text="自動調整DPI以達到目標大小", variable=self.auto_mode).pack(side=tk.LEFT, padx=5)
-        
-        # 進度顯示區域
-        progress_frame = ttk.LabelFrame(main_frame, text="處理進度", padding="5")
-        progress_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # 進度條
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
-        self.progress_bar.pack(fill=tk.X, padx=5, pady=5)
-        
-        # 狀態顯示
-        self.status_text = tk.Text(progress_frame, height=10, wrap=tk.WORD)
-        self.status_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # 開始按鈕
-        self.start_button = ttk.Button(main_frame, text="開始轉換", command=self.start_conversion)
-        self.start_button.pack(pady=10)
-        
-        # 儲存檔案路徑
-        self.pdf_files = []
+import pypdfium2 as pdfium
+from PIL import Image, ImageOps
 
-    def update_dpi_label(self, value):
-        self.dpi_label.configure(text=str(int(float(value))))
+try:  # 選用: 支援 iPhone 的 HEIC / HEIF
+    import pillow_heif
 
-    def add_files(self):
-        files = filedialog.askopenfilenames(
-            title="選擇PDF檔案",
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
+    pillow_heif.register_heif_opener()
+    HEIF_OK = True
+except Exception:
+    HEIF_OK = False
+
+try:  # 選用: 拖曳檔案進視窗
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+
+    DND_OK, DND_ERR = True, ""
+except Exception as _e:
+    DND_OK, DND_ERR = False, str(_e) or type(_e).__name__
+
+try:  # GUI 套件缺少時仍可 import 核心函式
+    import customtkinter as ctk
+    from tkinter import filedialog, messagebox
+except ImportError:
+    ctk = None
+
+# ----------------------------- 可調參數 -----------------------------
+MAX_AUTO_QUALITY = 90  # 自動模式品質上限
+MIN_AUTO_QUALITY = 50  # 自動模式先保證品質 >= 此值, 不夠才降解析度
+PANIC_QUALITY = 35  # 所有手段用盡後的最後一搏
+MIN_DPI = 72
+DPI_STEPS = (1.0, 0.85, 0.7, 0.6, 0.5)
+MEMORY_LIMIT = 1.2 * 1024**3
+WORKERS = max(1, os.cpu_count() or 1)
+A4_PT = (595.28, 841.89)
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+if HEIF_OK:
+    IMAGE_EXTS |= {".heic", ".heif"}
+SUPPORTED_EXTS = IMAGE_EXTS | {".pdf"}
+
+
+class Cancelled(Exception):
+    pass
+
+
+# ----------------------------- 多語言 -----------------------------
+# 語言檔放在 lang/ 資料夾, 每個 .json 一種語言:
+#   檔名(不含 .json) = 語言代碼, 例如 en.json -> "en"
+#   {"_meta": {"name": "English", "font": "(選填)字型名稱"}, "strings": {"鍵": "文字", ...}}
+# 缺少的鍵自動退回下面的內建繁體中文; 檔名以 _ 開頭的檔案會被忽略 (例如 _template.json)。
+DEFAULT_LANG = "zh_TW"
+DEFAULT_STRINGS = {
+    "app.title": "PDF 壓縮工具",
+    "app.subtitle": "壓縮 · 合併 · 拆分 · 圖片轉 PDF · 自動逼近目標大小",
+    "theme.light": "淺色",
+    "theme.dark": "深色",
+    "theme.system": "系統",
+    "files.title": "檔案",
+    "files.summary": "檔案  ·  {n} 個  ·  {size}",
+    "files.add": "＋ 添加檔案",
+    "files.clear": "清除",
+    "files.empty_dnd": "尚未加入檔案\n把 PDF 或圖片拖進視窗，或點右上角「＋ 添加檔案」",
+    "files.empty": "尚未加入檔案\n點右上角「＋ 添加檔案」選擇 PDF 或圖片",
+    "files.badge_pdf": "PDF",
+    "files.badge_image": "圖片",
+    "files.pages": "{n} 頁",
+    "files.pages_unknown": "? 頁",
+    "files.range_placeholder": "全部頁面",
+    "progress.title": "處理進度",
+    "settings.title": "設定",
+    "out.folder": "輸出資料夾 (留空 = 與原檔同資料夾)",
+    "out.browse": "瀏覽",
+    "omode.label": "輸出方式",
+    "omode.each": "各自輸出",
+    "omode.merge": "合併成一個",
+    "omode.split": "拆分頁面",
+    "omode.hint.each": "每個檔案各自輸出一個 PDF。PDF 可在清單中填頁碼範圍, 只保留需要的頁面。",
+    "omode.hint.merge": "清單中所有檔案 (PDF 與圖片) 依序接成一個 PDF, 可用 ↑ ↓ 調整順序。",
+    "omode.hint.split": "每個 PDF 依頁數拆成多個檔案 (圖片不受影響, 仍各自輸出)。",
+    "merge.name": "合併後檔名",
+    "split.every": "每",
+    "split.pages": "頁拆成一個檔案",
+    "cmode.label": "壓縮模式",
+    "cmode.auto": "自動壓到目標大小",
+    "cmode.manual": "手動設定",
+    "target.label": "目標大小 (MB, 每個輸出檔)",
+    "dpi.label": "DPI (自動模式為起始值)",
+    "quality.label": "JPEG 品質 (僅手動模式)",
+    "gray.switch": "轉灰階 (文件可再縮小很多)",
+    "btn.start": "開始轉換",
+    "btn.cancel": "取消",
+    "btn.open_out": "開啟輸出資料夾",
+    "dlg.pick": "選擇 PDF 或圖片",
+    "dlg.ft_supported": "PDF 與圖片",
+    "dlg.ft_pdf": "PDF",
+    "dlg.ft_all": "所有檔案",
+    "msg.error": "錯誤",
+    "msg.done": "完成",
+    "msg.bad_range": "頁碼有問題",
+    "msg.no_files": "請先添加要轉換的 PDF 或圖片！",
+    "msg.bad_target": "目標大小請輸入大於 0 的數字",
+    "msg.lang_busy": "處理中無法切換語言",
+    "log.skipped": "略過 {n} 個不支援的檔案",
+    "log.skipped_heif": " (想支援 HEIC 請 pip install pillow-heif)",
+    "log.mem_dpi": "頁數/尺寸過大, 為避免記憶體爆掉, 渲染 DPI 自動降為 {dpi}",
+    "log.dpi_q": "DPI {dpi}, 品質 {q}",
+    "log.limit_note": " (仍超過目標, 已是極限)",
+    "lang.load_failed": "語言檔 {file} 無法讀取: {err}",
+    "job.merge": "合併 {n} 個檔案",
+    "job.split_part": "{name} 第 {j}/{total} 份",
+    "run.item": "[{i}/{total}] {label}",
+    "run.done_compare": "  完成: {before} KB → {after} KB  ({pct}%)",
+    "run.warn_bigger": "  ⚠ 壓縮後沒有變小 (原檔可能已經很小), 建議保留原檔",
+    "run.done_out": "  完成: {size} → {file}",
+    "run.cancelled": "  已取消",
+    "run.failed": "  失敗: {err}",
+    "run.summary": "處理結束: 成功 {ok}/{total} 項",
+    "run.summary_cancelled": "  (已取消)",
+    "err.with_file": "{name}: {msg}",
+    "err.pdf_open": "無法開啟 {name} (可能有密碼保護或檔案損毀)",
+    "err.pdf_no_pages": "{name} 沒有任何頁面",
+    "err.pdf_page_out": "{name} 的頁碼超出範圍 (共 {n} 頁)",
+    "err.img_read": "無法讀取圖片 {name}",
+    "err.range_parse": "看不懂頁碼「{part}」, 格式範例: 1-3,5,8-",
+    "err.range_reversed": "頁碼「{part}」的起始頁大於結束頁",
+    "err.range_out": "頁碼「{part}」超出範圍 (此檔共 {n} 頁)",
+    "err.range_empty": "沒有選到任何頁面",
+    "err.no_pagecount_range": "讀不到頁數, 無法套用頁碼範圍",
+    "err.no_pagecount_split": "讀不到頁數 (可能有密碼), 無法拆分",
+    "dnd.unavailable": "拖曳功能無法使用 ({err}), 請確認已安裝 tkinterdnd2 (pip install tkinterdnd2)",
+    "dnd.admin": "目前以系統管理員身分執行, Windows 會阻擋從檔案總管拖曳檔案進來。請改用一般權限開啟程式 (或使用「＋ 添加檔案」)。",
+    "cli.no_ctk": "缺少 customtkinter, 請先執行: pip install -r requirements.txt",
+}
+
+
+def app_dir():
+    """程式所在資料夾 (打包成 exe 時為 exe 所在資料夾)。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def lang_dirs():
+    """可能存放 lang/ 的位置, 依優先順序: 程式旁 > 打包內建 > 目前工作目錄。"""
+    cands = [os.path.join(app_dir(), "lang")]
+    if getattr(sys, "frozen", False) and getattr(sys, "_MEIPASS", None):
+        cands.append(os.path.join(sys._MEIPASS, "lang"))
+    cands.append(os.path.join(os.getcwd(), "lang"))
+    seen, out = set(), []
+    for d in cands:
+        key = os.path.normcase(os.path.realpath(d))
+        if key not in seen and os.path.isdir(d):
+            seen.add(key)
+            out.append(d)
+    return out
+
+
+def system_locale():
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+
+            buf = ctypes.create_unicode_buffer(85)
+            if ctypes.windll.kernel32.GetUserDefaultLocaleName(buf, 85):
+                return buf.value  # 例如 zh-TW
+        except Exception:
+            pass
+    for v in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        val = os.environ.get(v)
+        if val:
+            return val.split(".")[0]
+    try:
+        import locale
+
+        return locale.getlocale()[0] or ""
+    except Exception:
+        return ""
+
+
+class I18N:
+    def __init__(self):
+        self.langs = {}  # 代碼 -> {"name", "strings", "font", "path"}
+        self.errors = []  # [(檔名, 錯誤訊息)]
+        self.code = DEFAULT_LANG
+        self.scan()
+
+    def scan(self):
+        self.langs, self.errors = {}, []
+        for d in lang_dirs():
+            for fn in sorted(os.listdir(d)):
+                stem, ext = os.path.splitext(fn)
+                if ext.lower() != ".json" or stem.startswith("_") or stem in self.langs:
+                    continue
+                path = os.path.join(d, fn)
+                try:
+                    with open(
+                        path, encoding="utf-8-sig"
+                    ) as f:  # utf-8-sig: 相容記事本存的 BOM
+                        data = json.load(f)
+                    if not isinstance(data, dict):
+                        raise ValueError("top level must be a JSON object")
+                    meta = (
+                        data.get("_meta") if isinstance(data.get("_meta"), dict) else {}
+                    )
+                    raw = data.get("strings")
+                    if not isinstance(raw, dict):  # 容錯: 允許不包 "strings", 直接平鋪
+                        raw = {k: v for k, v in data.items() if not k.startswith("_")}
+                    strings = {k: v for k, v in raw.items() if isinstance(v, str)}
+                    if not strings:
+                        raise ValueError("no usable translation strings")
+                    self.langs[stem] = {
+                        "name": str(meta.get("name") or stem),
+                        "strings": strings,
+                        "font": str(meta.get("font") or ""),
+                        "path": path,
+                    }
+                except (
+                    OSError,
+                    ValueError,
+                ) as e:  # JSONDecodeError 是 ValueError 的子類
+                    self.errors.append((fn, str(e)))
+        if DEFAULT_LANG not in self.langs:  # 內建語言永遠可用
+            self.langs[DEFAULT_LANG] = {
+                "name": "繁體中文",
+                "strings": {},
+                "font": "",
+                "path": "",
+            }
+        self.langs = dict(sorted(self.langs.items()))
+        if self.code not in self.langs:
+            self.code = DEFAULT_LANG
+
+    def guess(self):
+        loc = system_locale().replace("-", "_").lower()
+        if not loc:
+            return DEFAULT_LANG
+        low = {c.lower(): c for c in self.langs}
+        if loc in low:
+            return low[loc]
+        lang = loc.split("_")[0]
+        if lang == "zh":
+            trad = any(k in loc for k in ("tw", "hk", "mo", "hant"))
+            for c in (("zh_tw", "zh_hant") if trad else ("zh_cn", "zh_hans")):
+                if c in low:
+                    return low[c]
+        for lc, c in low.items():
+            if lc.split("_")[0] == lang:
+                return c
+        return DEFAULT_LANG
+
+    def set(self, code):
+        """code 為空或不存在 -> 依系統語言自動挑選。回傳實際採用的代碼。"""
+        self.code = code if code in self.langs else self.guess()
+        return self.code
+
+    def font(self):
+        return self.langs.get(self.code, {}).get("font", "")
+
+    def t(self, key, **kw):
+        s = self.langs.get(self.code, {}).get("strings", {}).get(key)
+        if s is None:
+            s = DEFAULT_STRINGS.get(key, key)
+        try:
+            return s.format(**kw) if kw else s
+        except (KeyError, IndexError, ValueError):  # 翻譯檔的占位符寫錯時不要讓程式壞掉
+            try:
+                return DEFAULT_STRINGS.get(key, key).format(**kw)
+            except Exception:
+                return s
+
+
+I18N_ = I18N()
+
+
+def t(key, **kw):
+    return I18N_.t(key, **kw)
+
+
+def export_lang_template(path=None):
+    """輸出翻譯範本 (lang/_template.json), 翻譯者複製後改檔名與內容即可。"""
+    path = path or os.path.join(app_dir(), "lang", "_template.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = {
+        "_meta": {"name": "Your Language Name", "font": ""},
+        "strings": DEFAULT_STRINGS,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return path
+
+
+# ----------------------------- 設定檔 -----------------------------
+DEFAULTS = {
+    "output_dir": "",
+    "dpi": 150,
+    "quality": 75,
+    "auto": True,
+    "target_mb": 4.0,
+    "gray": False,
+    "theme": "system",
+    "language": "",  # language 空字串 = 依系統語言
+    "output_mode": "each",  # each=各自輸出 / merge=合併成一個 / split=拆分頁面
+    "split_n": 1,
+    "merge_name": "merged",
+}
+
+
+def config_path():
+    if sys.platform.startswith("win"):
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "AutoPDF", "settings.json")
+
+
+def load_settings():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(config_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        for k, v in data.items():
+            if k in cfg and type(v) is type(cfg[k]):
+                cfg[k] = v
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save_settings(cfg):
+    try:
+        p = config_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass  # 存不了設定不該讓程式壞掉
+
+
+# ----------------------------- 核心 -----------------------------
+def _encode_jpeg(im, quality):
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
+def encode_all(pool, images, quality):
+    return list(pool.map(lambda im: _encode_jpeg(im, quality), images))
+
+
+def scale_all(pool, images, s):
+    if s == 1.0:
+        return images
+    return list(
+        pool.map(
+            lambda im: im.resize(
+                (max(1, round(im.width * s)), max(1, round(im.height * s))),
+                Image.LANCZOS,
+            ),
+            images,
         )
-        for file in files:
-            if file not in self.pdf_files:
-                self.pdf_files.append(file)
-                self.file_listbox.insert(tk.END, os.path.basename(file))
-    
-    def clear_files(self):
-        self.file_listbox.delete(0, tk.END)
-        self.pdf_files.clear()
-    
-    def remove_selected(self):
-        selection = self.file_listbox.curselection()
-        for index in reversed(selection):
-            self.file_listbox.delete(index)
-            self.pdf_files.pop(index)
-    
-    def browse_output(self):
-        folder = filedialog.askdirectory()
-        if folder:
-            self.output_path.set(folder)
-    
-    def update_status(self, message):
-        self.status_text.insert(tk.END, message + "\n")
-        self.status_text.see(tk.END)
-    
-    def convert_pdf_to_jpg(self, input_path, dpi):
-        images = convert_from_path(input_path, dpi=dpi)
-        jpg_files = []
-        
-        for i, image in enumerate(images):
-            jpg_path = f"temp_page_{i}.jpg"
-            image = image.convert("RGB")
-            image.save(jpg_path, 'JPEG')  # 不調整品質
-            jpg_files.append(jpg_path)
-        
-        return jpg_files
+    )
 
-    def create_pdf_from_jpg(self, jpg_files, output_path):
-        images = [Image.open(jpg_file) for jpg_file in jpg_files]
-        images[0].save(output_path, save_all=True, append_images=images[1:])
-        
-        for jpg_file in jpg_files:
-            os.remove(jpg_file)
 
-    def process_files(self):
-        output_folder = self.output_path.get()
-        
-        if not os.path.exists(output_folder):
-            os.makedirs(output_folder)
-        
-        total_files = len(self.pdf_files)
-        if total_files == 0:
-            self.update_status("請選擇要轉換的PDF檔案！")
-            return
-        
-        self.update_status(f"開始處理 {total_files} 個檔案")
-        
-        for input_path in self.pdf_files:
-            filename = os.path.basename(input_path)
-            output_path = os.path.join(output_folder, f"converted_{filename.replace('.pdf', '.pdf')}")
-            
-            if self.auto_mode.get():
-                current_dpi = self.dpi.get()
-                while True:
-                    jpg_files = self.convert_pdf_to_jpg(input_path, current_dpi)
-                    self.create_pdf_from_jpg(jpg_files, output_path)
-                    
-                    # 檢查輸出檔案大小
-                    output_size = os.path.getsize(output_path) / 1024  # 轉換為 KB
-                    if output_size <= self.target_size:
-                        self.update_status(f"檔案 {filename} 轉換完成，大小: {output_size:.2f} KB")
-                        break
-                    else:
-                        # 計算與目標大小的差距
-                        size_difference = output_size - self.target_size
-                        # 根據差距調整 DPI
-                        adjustment_factor = max(1, int(size_difference / 100))  # 每 100KB 調整一次
-                        current_dpi -= adjustment_factor
-                        if current_dpi < 72:  # 最小 DPI 限制
-                            self.update_status(f"無法達到目標大小，最小DPI為72，檔案大小: {output_size:.2f} KB")
-                            break
+def estimated_pdf_size(jpegs):
+    return sum(len(j) for j in jpegs) + 420 * len(jpegs) + 600
+
+
+def is_pdf(path):
+    return path.lower().endswith(".pdf")
+
+
+def parse_page_ranges(text, n):
+    """'1-3,5,8-' -> 0 起算的頁索引清單 (保留順序)。空字串 = 全部頁面。"""
+    txt = (text or "").strip()
+    if txt in ("", "全部", "all", "ALL"):
+        return list(range(n))
+    for ch, rep in (
+        ("，", ","),
+        ("、", ","),
+        ("－", "-"),
+        ("–", "-"),
+        ("～", "-"),
+        ("~", "-"),
+        (" ", ""),
+    ):
+        txt = txt.replace(ch, rep)
+    out = []
+    for part in txt.split(","):
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                a, b = part.split("-", 1)
+                lo, hi = (int(a) if a else 1), (int(b) if b else n)
             else:
-                
-                self.update_status(f"\n處理檔案: {filename}")
-                jpg_files = self.convert_pdf_to_jpg(input_path, self.dpi.get())
-                self.create_pdf_from_jpg(jpg_files, output_path)
-                output_size = os.path.getsize(output_path) / 1024  # 轉換為 KB
-                self.update_status(f"檔案 {filename} 轉換完成，大小: {output_size:.2f} KB")
-        
-        self.update_status("\n所有檔案處理完成！")
-        self.start_button.config(state=tk.NORMAL)
-        messagebox.showinfo("完成", "PDF轉換完成！")
-    
-    def start_conversion(self):
-        if not self.pdf_files:
-            messagebox.showerror("錯誤", "請選擇要轉換的PDF檔案！")
+                lo = hi = int(part)
+        except ValueError:
+            raise ValueError(t("err.range_parse", part=part)) from None
+        if lo > hi:
+            raise ValueError(t("err.range_reversed", part=part))
+        if lo < 1 or hi > n:
+            raise ValueError(t("err.range_out", part=part, n=n))
+        out.extend(range(lo - 1, hi))
+    if not out:
+        raise ValueError(t("err.range_empty"))
+    return out
+
+
+def pdf_page_count(path):
+    try:
+        with open(path, "rb") as fh:
+            pdf = pdfium.PdfDocument(fh)
+            try:
+                return len(pdf)
+            finally:
+                pdf.close()
+    except Exception:
+        return None
+
+
+def _open_pdf(path):
+    fh = open(path, "rb")  # 用檔案物件開, 避免 Windows 中文路徑問題
+    try:
+        return pdfium.PdfDocument(fh), fh
+    except Exception as e:
+        fh.close()
+        raise ValueError(t("err.pdf_open", name=os.path.basename(path))) from e
+
+
+def load_items(items, dpi, gray, cancel, prog):
+    """
+    items: [(路徑, 頁索引清單或 None), ...], PDF 與圖片可混合, 輸出順序即清單順序。
+    回傳 (images, page_sizes_pt, 實際 dpi)。每頁只渲染一次。
+    """
+    # 第一輪: 只量尺寸 (不渲染), 用來估記憶體
+    metas, sizes = [], []
+    for path, pages in items:
+        name = os.path.basename(path)
+        if is_pdf(path):
+            pdf, fh = _open_pdf(path)
+            try:
+                n = len(pdf)
+                if n == 0:
+                    raise ValueError(t("err.pdf_no_pages", name=name))
+                idx = list(pages) if pages is not None else list(range(n))
+                if any(i < 0 or i >= n for i in idx):
+                    raise ValueError(t("err.pdf_page_out", name=name, n=n))
+                for i in idx:
+                    pg = pdf[i]
+                    sizes.append(pg.get_size())
+                    pg.close()
+            finally:
+                pdf.close()
+                fh.close()
+            metas.append((True, path, idx))
+        else:
+            try:
+                with Image.open(path) as im:
+                    w, h = im.size
+            except Exception as e:
+                raise ValueError(t("err.img_read", name=name)) from e
+            sizes.append(_fit_a4(w, h))
+            metas.append((False, path, None))
+
+    total = len(sizes)
+    bytes_per_px = 1 if gray else 3
+    need = sum(w / 72 * dpi * h / 72 * dpi * bytes_per_px for w, h in sizes)
+    if need > MEMORY_LIMIT:  # 記憶體保護
+        dpi = max(MIN_DPI, dpi * math.sqrt(MEMORY_LIMIT / need))
+
+    # 第二輪: 真正渲染
+    images, out_sizes, done = [], [], 0
+    for pdf_flag, path, idx in metas:
+        if pdf_flag:
+            pdf, fh = _open_pdf(path)
+            try:
+                for i in idx:
+                    if cancel.is_set():
+                        raise Cancelled
+                    page = pdf[i]
+                    out_sizes.append(page.get_size())
+                    bmp = page.render(scale=dpi / 72, grayscale=gray)
+                    images.append(bmp.to_pil().convert("L" if gray else "RGB"))
+                    page.close()
+                    done += 1
+                    prog(0.6 * done / total)
+            finally:
+                pdf.close()
+                fh.close()
+        else:
+            if cancel.is_set():
+                raise Cancelled
+            im = _prepare_image(path, gray)
+            wpt, hpt = _fit_a4(*im.size)
+            tw = max(1, round(wpt / 72 * dpi))
+            if im.width > tw:  # 只縮小, 不放大
+                im = im.resize(
+                    (tw, max(1, round(im.height * tw / im.width))), Image.LANCZOS
+                )
+            images.append(im)
+            out_sizes.append((wpt, hpt))
+            done += 1
+            prog(0.6 * done / total)
+    return images, out_sizes, dpi
+
+
+def _prepare_image(path, gray):
+    with Image.open(path) as im0:
+        im0.load()
+        im = ImageOps.exif_transpose(im0)  # 手機照片的旋轉資訊
+    if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+        im = im.convert("RGBA")
+        bg = Image.new("RGB", im.size, "white")
+        bg.paste(im, mask=im.split()[-1])
+        im = bg
+    return im.convert("L" if gray else "RGB")
+
+
+def _fit_a4(w, h):
+    W, H = (A4_PT[1], A4_PT[0]) if w > h else A4_PT
+    s = min(W / w, H / h)
+    return w * s, h * s
+
+
+def write_pdf(path, jpegs, images, sizes_pt, gray):
+    """手寫最小 PDF: 直接嵌入 JPEG 位元組, 不重新編碼。"""
+    cs = b"/DeviceGray" if gray else b"/DeviceRGB"
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = []
+
+    def add(body):
+        offsets.append(len(out))
+        out.extend(f"{len(offsets)} 0 obj\n".encode())
+        out.extend(body)
+        out.extend(b"\nendobj\n")
+
+    n = len(jpegs)
+    kids = " ".join(f"{3 + 3 * i} 0 R" for i in range(n))
+    add(b"<< /Type /Catalog /Pages 2 0 R >>")
+    add(f"<< /Type /Pages /Kids [{kids}] /Count {n} >>".encode())
+    for i, (jpg, im, (w, h)) in enumerate(zip(jpegs, images, sizes_pt)):
+        cont_no, img_no = 4 + 3 * i, 5 + 3 * i
+        add(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w:.2f} {h:.2f}] "
+            f"/Contents {cont_no} 0 R "
+            f"/Resources << /XObject << /Im0 {img_no} 0 R >> >> >>".encode()
+        )
+        content = f"q {w:.2f} 0 0 {h:.2f} 0 0 cm /Im0 Do Q".encode()
+        add(b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream")
+        add(
+            b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace %s "
+            b"/BitsPerComponent 8 /Filter /DCTDecode /Length %d >>\nstream\n"
+            % (im.width, im.height, cs, len(jpg))
+            + jpg
+            + b"\nendstream"
+        )
+    xref = len(out)
+    out.extend(b"xref\n0 %d\n0000000000 65535 f \n" % (len(offsets) + 1))
+    for off in offsets:
+        out.extend(b"%010d 00000 n \n" % off)
+    out.extend(
+        b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+        % (len(offsets) + 1, xref)
+    )
+    tmp = path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(out)
+    os.replace(tmp, path)
+
+
+def _compress(load, dst, *, dpi, quality, target_kb, gray, cancel, log, progress):
+    with ThreadPoolExecutor(WORKERS) as pool:
+        images, sizes_pt, real_dpi = load()
+        if real_dpi < dpi - 0.5:
+            log("  " + t("log.mem_dpi", dpi=f"{real_dpi:.0f}"))
+        if target_kb is None:
+            jpegs = encode_all(pool, images, quality)
+            final_imgs = images
+            log("  " + t("log.dpi_q", dpi=f"{real_dpi:.0f}", q=quality))
+        else:
+            jpegs, final_imgs, info = _auto_search(
+                pool, images, real_dpi, target_kb * 1024, cancel, progress
+            )
+            log("  " + info)
+        if cancel.is_set():
+            raise Cancelled
+        write_pdf(dst, jpegs, final_imgs, sizes_pt, gray)
+    progress(1.0)
+    return os.path.getsize(dst) / 1024
+
+
+def convert(
+    items,
+    dst,
+    *,
+    dpi=150,
+    quality=75,
+    target_kb=None,
+    gray=False,
+    cancel=None,
+    log=print,
+    progress=lambda f: None,
+):
+    """
+    items: [(路徑, 頁索引清單或 None), ...] -> 單一輸出 PDF (PDF/圖片可混合 = 合併)。
+    target_kb=None -> 手動 (固定 dpi+quality); 數字 -> 自動逼近目標。回傳輸出 KB。
+    """
+    cancel = cancel or threading.Event()
+    return _compress(
+        lambda: load_items(items, dpi, gray, cancel, progress),
+        dst,
+        dpi=dpi,
+        quality=quality,
+        target_kb=target_kb,
+        gray=gray,
+        cancel=cancel,
+        log=log,
+        progress=progress,
+    )
+
+
+def compress_pdf(src, dst, pages=None, **kw):
+    return convert([(src, pages)], dst, **kw)
+
+
+def images_to_pdf(paths, dst, **kw):
+    return convert([(p, None) for p in paths], dst, **kw)
+
+
+def _auto_search(pool, images, base_dpi, budget, cancel, progress):
+    steps = [s for s in DPI_STEPS if s == 1.0 or base_dpi * s >= MIN_DPI]
+    iters = 0
+
+    def bump():
+        nonlocal iters
+        iters += 1
+        progress(0.6 + 0.38 * min(1.0, iters / 8))
+        if cancel.is_set():
+            raise Cancelled
+
+    last = None
+    for s in steps:
+        imgs = scale_all(pool, images, s)
+        data = encode_all(pool, imgs, MAX_AUTO_QUALITY)
+        bump()
+        if estimated_pdf_size(data) <= budget:
+            return (
+                data,
+                imgs,
+                t("log.dpi_q", dpi=f"{base_dpi * s:.0f}", q=MAX_AUTO_QUALITY),
+            )
+        data = encode_all(pool, imgs, MIN_AUTO_QUALITY)
+        bump()
+        last = (data, imgs, s)
+        if estimated_pdf_size(data) > budget:
+            continue
+        best, best_q = data, MIN_AUTO_QUALITY
+        lo, hi = MIN_AUTO_QUALITY + 1, MAX_AUTO_QUALITY - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            d = encode_all(pool, imgs, mid)
+            bump()
+            if estimated_pdf_size(d) <= budget:
+                best, best_q, lo = d, mid, mid + 1
+            else:
+                hi = mid - 1
+        return best, imgs, t("log.dpi_q", dpi=f"{base_dpi * s:.0f}", q=best_q)
+
+    data, imgs, s = last
+    data = encode_all(pool, imgs, PANIC_QUALITY)
+    bump()
+    note = "" if estimated_pdf_size(data) <= budget else t("log.limit_note")
+    return data, imgs, t("log.dpi_q", dpi=f"{base_dpi * s:.0f}", q=PANIC_QUALITY) + note
+
+
+def unique_path(path):
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    i = 1
+    while os.path.exists(f"{base} ({i}){ext}"):
+        i += 1
+    return f"{base} ({i}){ext}"
+
+
+def open_folder(path):
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception:
+        pass
+
+
+def is_admin():
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def fmt_size(n_bytes):
+    return (
+        f"{n_bytes / 1048576:.2f} MB"
+        if n_bytes >= 1048576
+        else f"{n_bytes / 1024:.0f} KB"
+    )
+
+
+# ----------------------------- GUI -----------------------------
+if sys.platform.startswith("win"):
+    UI_FONT = "Microsoft JhengHei UI"
+elif sys.platform == "darwin":
+    UI_FONT = "PingFang TC"
+else:
+    UI_FONT = None
+
+
+def F(size=13, weight="normal"):
+    fam = I18N_.font() or UI_FONT  # 語言檔可用 _meta.font 指定專屬字型
+    kw = {"family": fam} if fam else {}
+    return ctk.CTkFont(size=size, weight=weight, **kw)
+
+
+def theme_labels():
+    return {k: t(f"theme.{k}") for k in ("light", "dark", "system")}
+
+
+class App(ctk.CTk if ctk else object):
+    def __init__(self):
+        self.cfg = load_settings()
+        I18N_.set(self.cfg["language"])
+        ctk.set_appearance_mode(self.cfg["theme"])
+        ctk.set_default_color_theme("blue")
+        super().__init__()
+        self.geometry("1120x780")
+        self.minsize(980, 680)
+
+        self.files = []
+        self.ranges = {}  # 路徑 -> 使用者輸入的頁碼範圍文字
+        self.page_counts = {}  # 路徑 -> 頁數 (None = 讀不到)
+        self.q = queue.Queue()
+        self.cancel = threading.Event()
+        self.running = False
+        self.last_out = ""
+        self.dnd_active = False
+        self._dnd_loaded = False
+        self.header = self.left = self.right = None
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self.main = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
+        self.main.grid(row=0, column=0, sticky="nsew")
+        self.main.grid_columnconfigure(0, weight=1)
+        self.main.grid_columnconfigure(1, weight=0)
+        self.main.grid_rowconfigure(1, weight=1)
+        self.dnd_error = ""
+        self._build_ui()
+        for fn, err in I18N_.errors:
+            self.log(t("lang.load_failed", file=fn, err=err))
+        if not self.dnd_active:  # 拖曳不能用時, 直接在記錄區說明原因
+            self.log(t("dnd.unavailable", err=self.dnd_error or DND_ERR or "?"))
+        elif is_admin():
+            self.log(t("dnd.admin"))
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(80, self._poll)
+
+    def _build_ui(self):
+        """建立 (或在切換語言時重建) 整個介面。狀態都存在 self.cfg / self.files / self.ranges。"""
+        for w in (self.header, self.left, self.right):
+            if w is not None:
+                w.destroy()
+        self.title(t("app.title"))
+        self._build_header()
+        self._build_left()
+        self._build_right()
+        self.dnd_active = self._setup_dnd()
+        self._refresh_list()
+        self._apply_mode()
+        self._apply_output_mode()
+
+    # ---------- 拖曳 ----------
+    def _setup_dnd(self):
+        if not DND_OK:
+            self.dnd_error = DND_ERR
+            return False
+        try:
+            if not self._dnd_loaded:
+                require = getattr(TkinterDnD, "require", None) or TkinterDnD._require
+                require(
+                    self
+                )  # 載入 tkdnd; 根視窗本身不能註冊, 改註冊在容器與其所有子元件上
+                self._dnd_loaded = True
+            self._register_dnd_tree(self.main)
+            return True
+        except Exception as e:
+            self.dnd_error = str(e) or type(e).__name__
+            return False  # 拖曳失敗不影響其他功能
+
+    def _register_dnd_tree(self, widget):
+        """把 widget 與它底下每一個子元件都註冊成拖放目標。
+        CustomTkinter 的按鈕/標籤/清單列內部都還有子元件 (canvas), 滑鼠實際停在那上面;
+        在 Windows 上若只註冊外層框架, 游標會一直顯示禁止符號。"""
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._on_drop)
+        except Exception:
+            pass  # 少數元件不支援就略過
+        for child in widget.winfo_children():
+            self._register_dnd_tree(child)
+
+    def _on_drop(self, event):
+        if not self.running:
+            paths = []
+            for p in self.tk.splitlist(event.data):
+                if os.path.isdir(p):  # 拖資料夾 = 加入裡面所有支援的檔案
+                    for root, _, names in os.walk(p):
+                        paths += [os.path.join(root, n) for n in sorted(names)]
+                else:
+                    paths.append(p)
+            self.add_paths(paths)
+        return getattr(event, "action", None) or "copy"  # <<Drop>> 事件要回傳動作
+
+    # ---------- 版面 ----------
+    def _lang_labels(self):
+        """代碼 -> 選單顯示文字; 名稱重複時附上代碼以便分辨。"""
+        names = {c: i["name"] for c, i in I18N_.langs.items()}
+        vals = list(names.values())
+        return {c: (f"{n} ({c})" if vals.count(n) > 1 else n) for c, n in names.items()}
+
+    def _build_header(self):
+        h = self.header = ctk.CTkFrame(self.main, fg_color="transparent")
+        h.grid(row=0, column=0, columnspan=2, sticky="ew", padx=24, pady=(18, 4))
+        h.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(h, text=t("app.title"), font=F(24, "bold")).grid(
+            row=0, column=0, sticky="w"
+        )
+        ctk.CTkLabel(
+            h, text=t("app.subtitle"), font=F(12), text_color=("gray40", "gray65")
+        ).grid(row=1, column=0, sticky="w")
+        labels = self._lang_labels()
+        self._lang_by_label = {v: k for k, v in labels.items()}
+        self.lang_menu = ctk.CTkOptionMenu(
+            h,
+            values=list(labels.values()),
+            command=self._on_language,
+            font=F(12),
+            dropdown_font=F(12),
+            width=150,
+            state="normal" if len(labels) > 1 else "disabled",
+        )
+        self.lang_menu.set(labels[I18N_.code])
+        self.lang_menu.grid(row=0, column=1, rowspan=2, sticky="e", padx=(0, 10))
+        self.theme_seg = ctk.CTkSegmentedButton(
+            h, values=list(theme_labels().values()), command=self._on_theme, font=F(12)
+        )
+        self.theme_seg.set(theme_labels()[self.cfg["theme"]])
+        self.theme_seg.grid(row=0, column=2, rowspan=2, sticky="e")
+
+    def _build_left(self):
+        left = self.left = ctk.CTkFrame(self.main, fg_color="transparent")
+        left.grid(row=1, column=0, sticky="nsew", padx=(24, 10), pady=(8, 20))
+        left.grid_columnconfigure(0, weight=1)
+        left.grid_rowconfigure(0, weight=3)
+        left.grid_rowconfigure(1, weight=2)
+
+        fc = ctk.CTkFrame(left, corner_radius=14)
+        fc.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+        fc.grid_columnconfigure(0, weight=1)
+        fc.grid_rowconfigure(1, weight=1)
+        top = ctk.CTkFrame(fc, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 6))
+        top.grid_columnconfigure(0, weight=1)
+        self.count_label = ctk.CTkLabel(top, text=t("files.title"), font=F(15, "bold"))
+        self.count_label.grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(
+            top, text=t("files.add"), width=120, font=F(13), command=self.add_files
+        ).grid(row=0, column=1, padx=(0, 8))
+        ctk.CTkButton(
+            top,
+            text=t("files.clear"),
+            width=64,
+            font=F(13),
+            fg_color="transparent",
+            border_width=1,
+            text_color=("gray20", "gray85"),
+            command=self.clear_files,
+        ).grid(row=0, column=2)
+        self.list_frame = ctk.CTkScrollableFrame(fc, fg_color="transparent")
+        self.list_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.list_frame.grid_columnconfigure(0, weight=1)
+
+        pc = ctk.CTkFrame(left, corner_radius=14)
+        pc.grid(row=1, column=0, sticky="nsew")
+        pc.grid_columnconfigure(0, weight=1)
+        pc.grid_rowconfigure(2, weight=1)
+        ph = ctk.CTkFrame(pc, fg_color="transparent")
+        ph.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 6))
+        ph.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(ph, text=t("progress.title"), font=F(15, "bold")).grid(
+            row=0, column=0, sticky="w"
+        )
+        self.pct_label = ctk.CTkLabel(ph, text="0%", font=F(13))
+        self.pct_label.grid(row=0, column=1, sticky="e")
+        self.progress = ctk.CTkProgressBar(pc, height=10)
+        self.progress.set(0)
+        self.progress.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self.log_box = ctk.CTkTextbox(pc, font=F(12), wrap="word", state="disabled")
+        self.log_box.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+
+    def _build_right(self):
+        rc = self.right = ctk.CTkFrame(self.main, corner_radius=14, width=370)
+        rc.grid(row=1, column=1, sticky="ns", padx=(10, 24), pady=(8, 20))
+        rc.grid_propagate(False)
+        rc.grid_columnconfigure(0, weight=1)
+        rc.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(rc, text=t("settings.title"), font=F(15, "bold")).grid(
+            row=0, column=0, sticky="w", padx=18, pady=(14, 2)
+        )
+
+        sf = ctk.CTkScrollableFrame(rc, fg_color="transparent")
+        sf.grid(row=1, column=0, sticky="nsew", padx=6)
+        sf.grid_columnconfigure(0, weight=1)
+        P = dict(padx=12)
+
+        self._label(sf, 0, t("out.folder"))
+        of = ctk.CTkFrame(sf, fg_color="transparent")
+        of.grid(row=1, column=0, sticky="ew", pady=(0, 10), **P)
+        of.grid_columnconfigure(0, weight=1)
+        self.out_var = ctk.StringVar(value=self.cfg["output_dir"])
+        ctk.CTkEntry(of, textvariable=self.out_var, font=F(12)).grid(
+            row=0, column=0, sticky="ew"
+        )
+        ctk.CTkButton(
+            of, text=t("out.browse"), width=56, font=F(12), command=self.browse_output
+        ).grid(row=0, column=1, padx=(6, 0))
+
+        self._label(sf, 2, t("omode.label"))
+        self._omode_rev = {t(f"omode.{k}"): k for k in ("each", "merge", "split")}
+        self.omode_seg = ctk.CTkSegmentedButton(
+            sf,
+            values=list(self._omode_rev),
+            font=F(12),
+            command=lambda _=None: self._apply_output_mode(),
+        )
+        self.omode_seg.set(t(f"omode.{self.cfg['output_mode']}"))
+        self.omode_seg.grid(row=3, column=0, sticky="ew", pady=(0, 4), **P)
+        self.hint = ctk.CTkLabel(
+            sf,
+            text="",
+            font=F(11),
+            justify="left",
+            wraplength=300,
+            text_color=("gray40", "gray65"),
+            anchor="w",
+        )
+        self.hint.grid(row=4, column=0, sticky="w", pady=(0, 4), **P)
+
+        self.merge_frame = ctk.CTkFrame(sf, fg_color="transparent")
+        self.merge_frame.grid(row=5, column=0, sticky="ew", pady=(0, 8), **P)
+        ctk.CTkLabel(self.merge_frame, text=t("merge.name"), font=F(12)).grid(
+            row=0, column=0
+        )
+        self.merge_name_var = ctk.StringVar(value=self.cfg["merge_name"])
+        ctk.CTkEntry(
+            self.merge_frame, textvariable=self.merge_name_var, width=150, font=F(12)
+        ).grid(row=0, column=1, padx=6)
+        ctk.CTkLabel(self.merge_frame, text=".pdf", font=F(12)).grid(row=0, column=2)
+        self.split_frame = ctk.CTkFrame(sf, fg_color="transparent")
+        self.split_frame.grid(row=5, column=0, sticky="ew", pady=(0, 8), **P)
+        ctk.CTkLabel(self.split_frame, text=t("split.every"), font=F(12)).grid(
+            row=0, column=0
+        )
+        self.split_var = ctk.StringVar(value=str(self.cfg["split_n"]))
+        ctk.CTkEntry(
+            self.split_frame, textvariable=self.split_var, width=60, font=F(12)
+        ).grid(row=0, column=1, padx=6)
+        ctk.CTkLabel(self.split_frame, text=t("split.pages"), font=F(12)).grid(
+            row=0, column=2
+        )
+
+        self._label(sf, 6, t("cmode.label"))
+        self.mode_seg = ctk.CTkSegmentedButton(
+            sf,
+            values=[t("cmode.auto"), t("cmode.manual")],
+            font=F(12),
+            command=lambda _=None: self._apply_mode(),
+        )
+        self.mode_seg.set(t("cmode.auto") if self.cfg["auto"] else t("cmode.manual"))
+        self.mode_seg.grid(row=7, column=0, sticky="ew", pady=(0, 10), **P)
+
+        self._label(sf, 8, t("target.label"))
+        tf = ctk.CTkFrame(sf, fg_color="transparent")
+        tf.grid(row=9, column=0, sticky="ew", pady=(0, 10), **P)
+        self.target_var = ctk.StringVar(value=f"{self.cfg['target_mb']:g}")
+        self.target_entry = ctk.CTkEntry(
+            tf, textvariable=self.target_var, width=70, font=F(13)
+        )
+        self.target_entry.grid(row=0, column=0)
+        self.preset_btns = []
+        for i, mb in enumerate(("1", "2", "4", "10")):
+            b = ctk.CTkButton(
+                tf,
+                text=mb,
+                width=38,
+                height=28,
+                font=F(12),
+                fg_color=("gray80", "gray28"),
+                text_color=("gray10", "gray90"),
+                hover_color=("gray70", "gray35"),
+                command=lambda v=mb: self.target_var.set(v),
+            )
+            b.grid(row=0, column=i + 1, padx=(6, 0))
+            self.preset_btns.append(b)
+
+        self.dpi_var = ctk.IntVar(value=self.cfg["dpi"])
+        self._slider(sf, 10, t("dpi.label"), self.dpi_var, 72, 300)
+        self.q_var = ctk.IntVar(value=self.cfg["quality"])
+        self.q_slider = self._slider(sf, 12, t("quality.label"), self.q_var, 30, 95)
+
+        self.gray_var = ctk.BooleanVar(value=self.cfg["gray"])
+        ctk.CTkSwitch(
+            sf, text=t("gray.switch"), variable=self.gray_var, font=F(13)
+        ).grid(row=14, column=0, sticky="w", pady=(6, 10), **P)
+
+        bf = ctk.CTkFrame(rc, fg_color="transparent")
+        bf.grid(row=2, column=0, sticky="ew", padx=18, pady=(8, 16))
+        bf.grid_columnconfigure((0, 1), weight=1)
+        self.start_btn = ctk.CTkButton(
+            bf,
+            text=t("btn.start"),
+            height=42,
+            font=F(15, "bold"),
+            command=self.start,
+            state="disabled" if self.running else "normal",
+        )
+        self.start_btn.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.cancel_btn = ctk.CTkButton(
+            bf,
+            text=t("btn.cancel"),
+            height=34,
+            font=F(13),
+            state="normal" if self.running else "disabled",
+            fg_color="transparent",
+            border_width=1,
+            text_color=("gray20", "gray85"),
+            command=self.cancel.set,
+        )
+        self.cancel_btn.grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        ctk.CTkButton(
+            bf,
+            text=t("btn.open_out"),
+            height=34,
+            font=F(13),
+            fg_color="transparent",
+            border_width=1,
+            text_color=("gray20", "gray85"),
+            command=self.open_output,
+        ).grid(row=1, column=1, sticky="ew", padx=(4, 0))
+
+    def _label(self, parent, row, text):
+        ctk.CTkLabel(
+            parent, text=text, font=F(12), text_color=("gray35", "gray70")
+        ).grid(row=row, column=0, sticky="w", padx=12, pady=(2, 3))
+
+    def _slider(self, parent, row, text, var, lo, hi):
+        self._label(parent, row, text)
+        f = ctk.CTkFrame(parent, fg_color="transparent")
+        f.grid(row=row + 1, column=0, sticky="ew", padx=12, pady=(0, 8))
+        f.grid_columnconfigure(0, weight=1)
+        lab = ctk.CTkLabel(f, text=str(var.get()), width=36, font=F(13))
+
+        def on(v):
+            var.set(int(round(float(v))))
+            lab.configure(text=str(var.get()))
+
+        s = ctk.CTkSlider(f, from_=lo, to=hi, number_of_steps=hi - lo, command=on)
+        s.set(var.get())
+        s.grid(row=0, column=0, sticky="ew")
+        lab.grid(row=0, column=1, padx=(8, 0))
+        return s
+
+    # ---------- 狀態 ----------
+    def _output_mode(self):
+        return self._omode_rev.get(self.omode_seg.get(), "each")
+
+    def _is_auto(self):
+        return self.mode_seg.get() == t("cmode.auto")
+
+    def _apply_output_mode(self):
+        m = self._output_mode()
+        self.hint.configure(text=t(f"omode.hint.{m}"))
+        self.merge_frame.grid() if m == "merge" else self.merge_frame.grid_remove()
+        self.split_frame.grid() if m == "split" else self.split_frame.grid_remove()
+
+    def _apply_mode(self):
+        auto = self._is_auto()
+        self.target_entry.configure(state="normal" if auto else "disabled")
+        for b in self.preset_btns:
+            b.configure(state="normal" if auto else "disabled")
+        self.q_slider.configure(state="disabled" if auto else "normal")
+
+    def _on_theme(self, label):
+        key = next((k for k, v in theme_labels().items() if v == label), "system")
+        self.cfg["theme"] = key
+        ctk.set_appearance_mode(key)
+
+    def _on_language(self, label):
+        code = self._lang_by_label.get(label)
+        if not code or code == I18N_.code:
             return
-        
-        if not self.output_path.get():
-            messagebox.showerror("錯誤", "請選擇輸出資料夾！")
+        if self.running:  # 處理中重建介面會弄丟進度元件, 先擋下
+            self.lang_menu.set(self._lang_labels()[I18N_.code])
+            messagebox.showinfo(t("msg.error"), t("msg.lang_busy"))
             return
-        
-        self.start_button.config(state=tk.DISABLED)
-        self.status_text.delete(1.0, tk.END)
-        self.progress_var.set(0)
-        
-        threading.Thread(target=self.process_files, daemon=True).start()
+        self._collect_cfg()
+        log_text = self.log_box.get("1.0", "end-1c")
+        prog, pct = self.progress.get(), self.pct_label.cget("text")
+        self.cfg["language"] = I18N_.set(code)
+        save_settings(self.cfg)
+        self._build_ui()
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", log_text)
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+        self.progress.set(prog)
+        self.pct_label.configure(text=pct)
+
+    def _collect_cfg(self):
+        try:
+            mb = float(self.target_var.get())
+            if mb <= 0:
+                raise ValueError
+        except ValueError:
+            mb = None
+        try:
+            split_n = max(1, int(self.split_var.get()))
+        except ValueError:
+            split_n = self.cfg["split_n"]
+        name = self.merge_name_var.get().strip() or "merged"
+        self.cfg.update(
+            output_dir=self.out_var.get().strip(),
+            dpi=self.dpi_var.get(),
+            quality=self.q_var.get(),
+            auto=self._is_auto(),
+            gray=self.gray_var.get(),
+            output_mode=self._output_mode(),
+            split_n=split_n,
+            merge_name=name,
+        )
+        if mb:
+            self.cfg["target_mb"] = mb
+        return mb
+
+    def _on_close(self):
+        self._collect_cfg()
+        save_settings(self.cfg)
+        self.cancel.set()
+        self.destroy()
+
+    # ---------- 檔案 ----------
+    def add_files(self):
+        pats = " ".join(f"*{e}" for e in sorted(SUPPORTED_EXTS))
+        paths = filedialog.askopenfilenames(
+            title=t("dlg.pick"),
+            filetypes=[
+                (t("dlg.ft_supported"), pats),
+                (t("dlg.ft_pdf"), "*.pdf"),
+                (t("dlg.ft_all"), "*.*"),
+            ],
+        )
+        self.add_paths(paths)
+
+    def add_paths(self, paths):
+        skipped = 0
+        for p in paths:
+            if os.path.splitext(p)[1].lower() not in SUPPORTED_EXTS:
+                skipped += 1
+            elif p not in self.files:
+                self.files.append(p)
+                if is_pdf(p):
+                    self.page_counts[p] = pdf_page_count(p)
+        if skipped:
+            self.log(
+                t("log.skipped", n=skipped) + ("" if HEIF_OK else t("log.skipped_heif"))
+            )
+        self._refresh_list()
+
+    def clear_files(self):
+        if not self.running:
+            self.files.clear()
+            self.ranges.clear()
+            self.page_counts.clear()
+            self._refresh_list()
+
+    def remove_file(self, path):
+        if not self.running and path in self.files:
+            self.files.remove(path)
+            self.ranges.pop(path, None)
+            self.page_counts.pop(path, None)
+            self._refresh_list()
+
+    def move_file(self, path, delta):
+        if self.running or path not in self.files:
+            return
+        i = self.files.index(path)
+        j = i + delta
+        if 0 <= j < len(self.files):
+            self.files[i], self.files[j] = self.files[j], self.files[i]
+            self._refresh_list()
+
+    def _refresh_list(self):
+        for w in self.list_frame.winfo_children():
+            w.destroy()
+        total = 0
+        if not self.files:
+            ctk.CTkLabel(
+                self.list_frame,
+                text=t("files.empty_dnd" if self.dnd_active else "files.empty"),
+                font=F(13),
+                text_color=("gray45", "gray60"),
+            ).grid(pady=60)
+        flat = dict(
+            fg_color="transparent",
+            text_color=("gray30", "gray70"),
+            hover_color=("gray78", "gray30"),
+            font=F(12),
+            width=26,
+            height=26,
+        )
+        for i, p in enumerate(self.files):
+            try:
+                size = os.path.getsize(p)
+            except OSError:
+                size = 0
+            total += size
+            row = ctk.CTkFrame(
+                self.list_frame, corner_radius=10, fg_color=("gray90", "gray20")
+            )
+            row.grid(row=i, column=0, sticky="ew", pady=3, padx=2)
+            row.grid_columnconfigure(1, weight=1)
+            pdf_flag = is_pdf(p)
+            ctk.CTkLabel(
+                row,
+                text=t("files.badge_pdf" if pdf_flag else "files.badge_image"),
+                width=46,
+                font=F(11, "bold"),
+                corner_radius=6,
+                text_color="white",
+                fg_color=("#3b82f6", "#2563eb") if pdf_flag else ("#10b981", "#059669"),
+            ).grid(row=0, column=0, padx=(10, 8), pady=8)
+            ctk.CTkLabel(row, text=os.path.basename(p), anchor="w", font=F(13)).grid(
+                row=0, column=1, sticky="ew"
+            )
+            if pdf_flag:
+                n = self.page_counts.get(p)
+                ctk.CTkLabel(
+                    row,
+                    text=t("files.pages", n=n) if n else t("files.pages_unknown"),
+                    font=F(12),
+                    width=44,
+                    text_color=("gray40", "gray65"),
+                ).grid(row=0, column=2, padx=(6, 2))
+                ent = ctk.CTkEntry(
+                    row,
+                    width=92,
+                    height=26,
+                    font=F(12),
+                    placeholder_text=t("files.range_placeholder"),
+                )
+                if self.ranges.get(p):
+                    ent.insert(0, self.ranges[p])
+                ent.bind(
+                    "<KeyRelease>",
+                    lambda e, p=p, w=ent: self.ranges.__setitem__(p, w.get()),
+                )
+                ent.grid(row=0, column=3, padx=4)
+            ctk.CTkLabel(
+                row,
+                text=fmt_size(size),
+                font=F(12),
+                width=64,
+                text_color=("gray40", "gray65"),
+            ).grid(row=0, column=4, padx=4)
+            ctk.CTkButton(
+                row, text="↑", command=lambda p=p: self.move_file(p, -1), **flat
+            ).grid(row=0, column=5)
+            ctk.CTkButton(
+                row, text="↓", command=lambda p=p: self.move_file(p, 1), **flat
+            ).grid(row=0, column=6)
+            ctk.CTkButton(
+                row, text="✕", command=lambda p=p: self.remove_file(p), **flat
+            ).grid(row=0, column=7, padx=(0, 6))
+        n = len(self.files)
+        self.count_label.configure(
+            text=(
+                t("files.title")
+                if not n
+                else t("files.summary", n=n, size=fmt_size(total))
+            )
+        )
+        if self.dnd_active:
+            self._register_dnd_tree(self.list_frame)
+
+    def browse_output(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.out_var.set(d)
+
+    def open_output(self):
+        folder = (
+            self.out_var.get().strip()
+            or self.last_out
+            or (os.path.dirname(self.files[0]) if self.files else "")
+        )
+        if folder and os.path.isdir(folder):
+            open_folder(folder)
+
+    # ---------- log / 進度 ----------
+    def log(self, msg):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", msg + "\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def _poll(self):
+        try:
+            while True:
+                kind, val = self.q.get_nowait()
+                if kind == "log":
+                    self.log(val)
+                elif kind == "progress":
+                    self.progress.set(val)
+                    self.pct_label.configure(text=f"{val * 100:.0f}%")
+                elif kind == "done":
+                    self._finish(val)
+        except queue.Empty:
+            pass
+        self.after(80, self._poll)
+
+    def _finish(self, summary):
+        self.running = False
+        self.start_btn.configure(state="normal")
+        self.cancel_btn.configure(state="disabled")
+        self.log("\n" + summary)
+        messagebox.showinfo(t("msg.done"), summary)
+
+    # ---------- 規劃工作 ----------
+    def _selected_pages(self, p):
+        txt = self.ranges.get(p, "").strip()
+        if not txt:
+            return None
+        name = os.path.basename(p)
+        n = self.page_counts.get(p)
+        if not n:
+            raise ValueError(
+                t("err.with_file", name=name, msg=t("err.no_pagecount_range"))
+            )
+        try:
+            return parse_page_ranges(txt, n)
+        except ValueError as e:
+            raise ValueError(t("err.with_file", name=name, msg=str(e))) from None
+
+    def plan_jobs(self):
+        """回傳 job 清單; 每個 job = 一個輸出 PDF。頁碼有誤會丟出 ValueError。"""
+        mode = self.cfg["output_mode"]
+        files = list(self.files)
+        sel = {p: self._selected_pages(p) for p in files if is_pdf(p)}
+
+        def each(p):
+            name = os.path.splitext(os.path.basename(p))[0]
+            out = f"{name}_compressed.pdf" if is_pdf(p) else f"{name}.pdf"
+            return dict(
+                items=[(p, sel.get(p))],
+                name=out,
+                src=p,
+                label=os.path.basename(p),
+                compare=is_pdf(p) and sel.get(p) is None,
+            )
+
+        if mode == "merge":
+            items = [(p, sel.get(p)) for p in files]
+            return [
+                dict(
+                    items=items,
+                    name=f"{self.cfg['merge_name']}.pdf",
+                    src=files[0],
+                    label=t("job.merge", n=len(files)),
+                    compare=False,
+                )
+            ]
+
+        jobs = []
+        for p in files:
+            if mode == "split" and is_pdf(p):
+                base = os.path.basename(p)
+                n = self.page_counts.get(p)
+                if not n:
+                    raise ValueError(
+                        t("err.with_file", name=base, msg=t("err.no_pagecount_split"))
+                    )
+                idx = sel[p] if sel[p] is not None else list(range(n))
+                size = self.cfg["split_n"]
+                stem = os.path.splitext(base)[0]
+                chunks = [idx[k : k + size] for k in range(0, len(idx), size)]
+                for j, ch in enumerate(chunks, 1):
+                    contiguous = ch == list(range(ch[0], ch[0] + len(ch)))
+                    if contiguous:
+                        tag = (
+                            f"p{ch[0] + 1}"
+                            if len(ch) == 1
+                            else f"p{ch[0] + 1}-{ch[-1] + 1}"
+                        )
+                    else:
+                        tag = f"part{j:02d}"
+                    jobs.append(
+                        dict(
+                            items=[(p, ch)],
+                            name=f"{stem}_{tag}.pdf",
+                            src=p,
+                            label=t(
+                                "job.split_part", name=base, j=j, total=len(chunks)
+                            ),
+                            compare=False,
+                        )
+                    )
+            else:
+                jobs.append(each(p))
+        return jobs
+
+    def start(self):
+        if self.running:
+            return
+        if not self.files:
+            messagebox.showerror(t("msg.error"), t("msg.no_files"))
+            return
+        mb = self._collect_cfg()
+        if self.cfg["auto"] and mb is None:
+            messagebox.showerror(t("msg.error"), t("msg.bad_target"))
+            return
+        try:
+            jobs = self.plan_jobs()
+        except ValueError as e:
+            messagebox.showerror(t("msg.bad_range"), str(e))
+            return
+        save_settings(self.cfg)
+        opts = dict(
+            dpi=self.cfg["dpi"],
+            quality=self.cfg["quality"],
+            target_kb=mb * 1024 if self.cfg["auto"] else None,
+            gray=self.cfg["gray"],
+        )
+        self.running = True
+        self.cancel.clear()
+        self.start_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+        self.progress.set(0)
+        self.pct_label.configure(text="0%")
+        threading.Thread(
+            target=self._run, args=(jobs, self.cfg["output_dir"], opts), daemon=True
+        ).start()
+
+    def _run(self, jobs, out_dir, opts):
+        say = lambda m: self.q.put(("log", m))
+        total, ok = len(jobs), 0
+        used = set()
+        for idx, job in enumerate(jobs):
+            if self.cancel.is_set():
+                break
+            folder = out_dir or os.path.dirname(job["src"])
+            say(t("run.item", i=idx + 1, total=total, label=job["label"]))
+            dst = ""
+            try:
+                os.makedirs(folder, exist_ok=True)
+                dst = unique_path(os.path.join(folder, job["name"]))
+                while dst in used:  # 同一次工作內也不互相覆蓋
+                    dst = unique_path(dst[:-4] + " (1).pdf")
+                used.add(dst)
+                prog = lambda f, i=idx: self.q.put(("progress", (i + f) / total))
+                size_kb = convert(
+                    job["items"],
+                    dst,
+                    cancel=self.cancel,
+                    log=say,
+                    progress=prog,
+                    **opts,
+                )
+                if job["compare"]:
+                    before = os.path.getsize(job["src"]) / 1024
+                    say(
+                        t(
+                            "run.done_compare",
+                            before=f"{before:.0f}",
+                            after=f"{size_kb:.0f}",
+                            pct=f"{size_kb / before * 100:.0f}",
+                        )
+                    )
+                    if size_kb >= before:
+                        say(t("run.warn_bigger"))
+                else:
+                    say(
+                        t(
+                            "run.done_out",
+                            size=fmt_size(size_kb * 1024),
+                            file=os.path.basename(dst),
+                        )
+                    )
+                self.last_out = folder
+                ok += 1
+            except Cancelled:
+                say(t("run.cancelled"))
+                if dst and os.path.exists(dst + ".part"):
+                    os.remove(dst + ".part")
+                break
+            except Exception as e:  # 單一工作失敗 (加密、損毀…) 不影響其他
+                say(t("run.failed", err=e))
+        self.q.put(("progress", 1.0 if not self.cancel.is_set() else 0))
+        self.q.put(
+            (
+                "done",
+                t("run.summary", ok=ok, total=total)
+                + (t("run.summary_cancelled") if self.cancel.is_set() else ""),
+            )
+        )
+
 
 def main():
-    root = tk.Tk()
-    app = PDFCompressorGUI(root)
-    root.mainloop()
+    if "--export-lang" in sys.argv:  # 給翻譯者: python autopdf.py --export-lang
+        print(export_lang_template())
+        return
+    if ctk is None:
+        sys.exit(t("cli.no_ctk"))
+    App().mainloop()
+
 
 if __name__ == "__main__":
     main()
