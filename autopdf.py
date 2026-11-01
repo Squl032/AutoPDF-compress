@@ -17,6 +17,7 @@ AutoPDF-compress (改良版)
 注意: 輸出是「圖片式 PDF」, 原本可選取/搜尋的文字會消失。
 """
 
+import collections
 import importlib.util
 import io
 import json
@@ -24,6 +25,7 @@ import math
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -93,7 +95,12 @@ DEFAULT_STRINGS = {
     "msg.lang_busy": "處理中無法切換語言",
     "log.skipped": "略過 {n} 個不支援的檔案",
     "log.skipped_heif": " (想支援 HEIC 請 pip install pillow-heif)",
-    "log.mem_dpi": "頁數/尺寸過大, 為避免記憶體爆掉, 渲染 DPI 自動降為 {dpi}",
+    "log.sampling": "頁數較多 ({n} 頁), 先抽樣 {k} 頁估算壓縮設定",
+    "log.retry": "實際大小 {size} 超過目標, 調整後重試 ({i}/{max})",
+    "log.gray_note": ", 灰階",
+    "log.low_quality": "⚠ 為達成目標大小已大幅降低畫質, 內容可能難以閱讀",
+    "tfirst.switch": "優先達成目標大小",
+    "tfirst.hint": "必要時大幅降低畫質並自動轉灰階 (關閉則保留最低畫質)",
     "log.dpi_q": "DPI {dpi}, 品質 {q}",
     "log.limit_note": " (仍超過目標, 已是極限)",
     "lang.load_failed": "語言檔 {file} 無法讀取: {err}",
@@ -101,6 +108,7 @@ DEFAULT_STRINGS = {
     "job.split_part": "{name} 第 {j}/{total} 份",
     "run.item": "[{i}/{total}] {label}",
     "run.done_compare": "  完成: {before} KB → {after} KB  ({pct}%)",
+    "run.already_small": "  原檔 ({size}) 已小於目標大小, 直接複製, 不重新壓縮",
     "run.warn_bigger": "  ⚠ 壓縮後沒有變小 (原檔可能已經很小), 建議保留原檔",
     "run.done_out": "  完成: {size} → {file}",
     "run.cancelled": "  已取消",
@@ -332,7 +340,8 @@ DEFAULTS = {
     "gray": False,
     "theme": "system",
     "language": "",
-    "skip_optional_packages": False,  # language 空字串 = 依系統語言
+    "skip_optional_packages": False,
+    "target_first": True,  # language 空字串 = 依系統語言
     "output_mode": "each",  # each=各自輸出 / merge=合併成一個 / split=拆分頁面
     "split_n": 1,
     "merge_name": "merged",
@@ -633,12 +642,28 @@ except ImportError:
     ctk = None
 
 # ----------------------------- 可調參數 -----------------------------
-MAX_AUTO_QUALITY = 90  # 自動模式品質上限
-MIN_AUTO_QUALITY = 50  # 自動模式先保證品質 >= 此值, 不夠才降解析度
-PANIC_QUALITY = 35  # 所有手段用盡後的最後一搏
-MIN_DPI = 72
-DPI_STEPS = (1.0, 0.85, 0.7, 0.6, 0.5)
-MEMORY_LIMIT = 1.2 * 1024**3
+MAX_AUTO_QUALITY = 90  # (保留) 自動模式品質上限
+MIN_DPI = 72  # 一般階梯的解析度下限
+HARD_MIN_DPI = 30  # 「優先達成目標」時的解析度下限
+FALLBACK_QUALITY = 35  # 所有階梯都超標時, 最後一階再壓一次用的品質
+SAMPLE_BYTES = 128 * 1024**2  # 抽樣階段最多同時放在記憶體的點陣圖大小
+SAMPLE_MAX_PAGES = 40
+MAX_ATTEMPTS = 4  # 抽樣估算不準時, 最多修正重試幾次
+# 階梯 = (解析度比例, 品質下限, 品質上限, 是否轉灰階); 先保品質, 保不住才降解析度, 最後才轉灰階
+TIERS_NORMAL = [
+    (1.0, 50, 90, False),
+    (0.85, 50, 90, False),
+    (0.7, 50, 90, False),
+    (0.6, 50, 90, False),
+    (0.5, 50, 90, False),
+]
+TIERS_EXTRA = [
+    (0.5, 50, 90, True),
+    (0.4, 40, 90, True),
+    (0.33, 30, 90, True),
+    (0.25, 20, 90, True),
+    (0.2, 15, 60, True),
+]
 WORKERS = max(1, os.cpu_count() or 1)
 A4_PT = (595.28, 841.89)
 
@@ -680,6 +705,10 @@ def scale_all(pool, images, s):
 
 def estimated_pdf_size(jpegs):
     return sum(len(j) for j in jpegs) + 420 * len(jpegs) + 600
+
+
+def _payload(jpegs):
+    return sum(len(j) for j in jpegs)
 
 
 def is_pdf(path):
@@ -744,83 +773,6 @@ def _open_pdf(path):
         raise ValueError(t("err.pdf_open", name=os.path.basename(path))) from e
 
 
-def load_items(items, dpi, gray, cancel, prog):
-    """
-    items: [(路徑, 頁索引清單或 None), ...], PDF 與圖片可混合, 輸出順序即清單順序。
-    回傳 (images, page_sizes_pt, 實際 dpi)。每頁只渲染一次。
-    """
-    # 第一輪: 只量尺寸 (不渲染), 用來估記憶體
-    metas, sizes = [], []
-    for path, pages in items:
-        name = os.path.basename(path)
-        if is_pdf(path):
-            pdf, fh = _open_pdf(path)
-            try:
-                n = len(pdf)
-                if n == 0:
-                    raise ValueError(t("err.pdf_no_pages", name=name))
-                idx = list(pages) if pages is not None else list(range(n))
-                if any(i < 0 or i >= n for i in idx):
-                    raise ValueError(t("err.pdf_page_out", name=name, n=n))
-                for i in idx:
-                    pg = pdf[i]
-                    sizes.append(pg.get_size())
-                    pg.close()
-            finally:
-                pdf.close()
-                fh.close()
-            metas.append((True, path, idx))
-        else:
-            try:
-                with Image.open(path) as im:
-                    w, h = im.size
-            except Exception as e:
-                raise ValueError(t("err.img_read", name=name)) from e
-            sizes.append(_fit_a4(w, h))
-            metas.append((False, path, None))
-
-    total = len(sizes)
-    bytes_per_px = 1 if gray else 3
-    need = sum(w / 72 * dpi * h / 72 * dpi * bytes_per_px for w, h in sizes)
-    if need > MEMORY_LIMIT:  # 記憶體保護
-        dpi = max(MIN_DPI, dpi * math.sqrt(MEMORY_LIMIT / need))
-
-    # 第二輪: 真正渲染
-    images, out_sizes, done = [], [], 0
-    for pdf_flag, path, idx in metas:
-        if pdf_flag:
-            pdf, fh = _open_pdf(path)
-            try:
-                for i in idx:
-                    if cancel.is_set():
-                        raise Cancelled
-                    page = pdf[i]
-                    out_sizes.append(page.get_size())
-                    bmp = page.render(scale=dpi / 72, grayscale=gray)
-                    images.append(bmp.to_pil().convert("L" if gray else "RGB"))
-                    page.close()
-                    done += 1
-                    prog(0.6 * done / total)
-            finally:
-                pdf.close()
-                fh.close()
-        else:
-            if cancel.is_set():
-                raise Cancelled
-            im = _prepare_image(path, gray)
-            wpt, hpt = _fit_a4(*im.size)
-            tw = max(1, round(wpt / 72 * dpi))
-            if im.width > tw:  # 只縮小, 不放大
-                im = im.resize(
-                    (tw, max(1, round(im.height * tw / im.width))), Image.LANCZOS
-                )
-            images.append(im)
-            out_sizes.append((wpt, hpt))
-            done += 1
-            prog(0.6 * done / total)
-    return images, out_sizes, dpi
-
-
 def _prepare_image(path, gray):
     with Image.open(path) as im0:
         im0.load()
@@ -839,7 +791,115 @@ def _fit_a4(w, h):
     return w * s, h * s
 
 
-def write_pdf(path, jpegs, images, sizes_pt, gray):
+class PageSource:
+    """依序提供所有輸出頁面。一次只渲染一頁, 不會把整份文件的點陣圖放進記憶體,
+    所以記憶體用量與頁數無關。"""
+
+    def __init__(self, items, cancel):
+        self.cancel = cancel
+        self.pages = []  # (種類, 路徑, 頁索引, 頁面尺寸 pt)
+        self._cur = None  # (路徑, pdf, fh): 只保留最近使用的一份 PDF
+        try:
+            for path, pages in items:
+                name = os.path.basename(path)
+                if is_pdf(path):
+                    pdf = self._doc(path)
+                    n = len(pdf)
+                    if n == 0:
+                        raise ValueError(t("err.pdf_no_pages", name=name))
+                    idx = list(pages) if pages is not None else list(range(n))
+                    if any(i < 0 or i >= n for i in idx):
+                        raise ValueError(t("err.pdf_page_out", name=name, n=n))
+                    for i in idx:
+                        pg = pdf[i]
+                        size = pg.get_size()
+                        pg.close()
+                        self.pages.append(("pdf", path, i, size))
+                else:
+                    try:
+                        with Image.open(path) as im:
+                            w, h = im.size
+                    except Exception as e:
+                        raise ValueError(t("err.img_read", name=name)) from e
+                    self.pages.append(("img", path, None, _fit_a4(w, h)))
+        except Exception:
+            self.close()
+            raise
+
+    def _doc(self, path):
+        if self._cur and self._cur[0] == path:
+            return self._cur[1]
+        self._close_cur()
+        pdf, fh = _open_pdf(path)
+        self._cur = (path, pdf, fh)
+        return pdf
+
+    def _close_cur(self):
+        if self._cur:
+            _, pdf, fh = self._cur
+            for c in (pdf, fh):
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            self._cur = None
+
+    def close(self):
+        self._close_cur()
+
+    def render(self, i, dpi, gray):
+        """渲染第 i 頁, 回傳 (PIL 圖片, 頁面尺寸 pt)。"""
+        kind, path, idx, size = self.pages[i]
+        if kind == "pdf":
+            page = self._doc(path)[idx]
+            try:
+                bmp = page.render(scale=dpi / 72, grayscale=gray)
+                im = bmp.to_pil().convert("L" if gray else "RGB")
+            finally:
+                page.close()
+            return im, size
+        im = _prepare_image(path, gray)
+        wpt, hpt = _fit_a4(*im.size)
+        tw = max(1, round(wpt / 72 * dpi))
+        if im.width > tw:  # 只縮小, 不放大
+            im = im.resize(
+                (tw, max(1, round(im.height * tw / im.width))), Image.LANCZOS
+            )
+        return im, (wpt, hpt)
+
+    def avg_page_bytes(self, dpi, gray):
+        bpp = 1 if gray else 3
+        return sum(
+            w / 72 * dpi * h / 72 * dpi * bpp for *_, (w, h) in self.pages
+        ) / len(self.pages)
+
+
+def stream_encode(src, pool, dpi, quality, gray, cancel, prog):
+    """逐頁渲染 -> 平行 JPEG 編碼。記憶體只會同時存在少數幾頁的點陣圖。"""
+    n = len(src.pages)
+    jpegs, px, sizes = [None] * n, [None] * n, [None] * n
+    pending = collections.deque()
+
+    def finish(entry):
+        i, fut = entry
+        jpegs[i] = fut.result()
+
+    for i in range(n):
+        if cancel.is_set():
+            raise Cancelled
+        im, size = src.render(i, dpi, gray)
+        px[i], sizes[i] = im.size, size
+        pending.append((i, pool.submit(_encode_jpeg, im, quality)))
+        del im
+        while len(pending) > WORKERS * 2:  # 限制排隊中的點陣圖數量
+            finish(pending.popleft())
+        prog((i + 1) / n)
+    while pending:
+        finish(pending.popleft())
+    return jpegs, px, sizes
+
+
+def write_pdf(path, jpegs, px_sizes, sizes_pt, gray):
     """手寫最小 PDF: 直接嵌入 JPEG 位元組, 不重新編碼。"""
     cs = b"/DeviceGray" if gray else b"/DeviceRGB"
     out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
@@ -855,7 +915,7 @@ def write_pdf(path, jpegs, images, sizes_pt, gray):
     kids = " ".join(f"{3 + 3 * i} 0 R" for i in range(n))
     add(b"<< /Type /Catalog /Pages 2 0 R >>")
     add(f"<< /Type /Pages /Kids [{kids}] /Count {n} >>".encode())
-    for i, (jpg, im, (w, h)) in enumerate(zip(jpegs, images, sizes_pt)):
+    for i, (jpg, (pw, ph), (w, h)) in enumerate(zip(jpegs, px_sizes, sizes_pt)):
         cont_no, img_no = 4 + 3 * i, 5 + 3 * i
         add(
             f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w:.2f} {h:.2f}] "
@@ -867,7 +927,7 @@ def write_pdf(path, jpegs, images, sizes_pt, gray):
         add(
             b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace %s "
             b"/BitsPerComponent 8 /Filter /DCTDecode /Length %d >>\nstream\n"
-            % (im.width, im.height, cs, len(jpg))
+            % (pw, ph, cs, len(jpg))
             + jpg
             + b"\nendstream"
         )
@@ -885,25 +945,69 @@ def write_pdf(path, jpegs, images, sizes_pt, gray):
     os.replace(tmp, path)
 
 
-def _compress(load, dst, *, dpi, quality, target_kb, gray, cancel, log, progress):
-    with ThreadPoolExecutor(WORKERS) as pool:
-        images, sizes_pt, real_dpi = load()
-        if real_dpi < dpi - 0.5:
-            log("  " + t("log.mem_dpi", dpi=f"{real_dpi:.0f}"))
-        if target_kb is None:
-            jpegs = encode_all(pool, images, quality)
-            final_imgs = images
-            log("  " + t("log.dpi_q", dpi=f"{real_dpi:.0f}", q=quality))
-        else:
-            jpegs, final_imgs, info = _auto_search(
-                pool, images, real_dpi, target_kb * 1024, cancel, progress
-            )
-            log("  " + info)
-        if cancel.is_set():
-            raise Cancelled
-        write_pdf(dst, jpegs, final_imgs, sizes_pt, gray)
-    progress(1.0)
-    return os.path.getsize(dst) / 1024
+def _tiers(base_dpi, gray, target_first):
+    """壓縮『階梯』: (解析度比例, 品質下限, 品質上限, 轉灰階)。依序嘗試, 越後面畫質越差。"""
+    out = [x for x in TIERS_NORMAL if x[0] == 1.0 or base_dpi * x[0] >= MIN_DPI]
+    if target_first:
+        out += [x for x in TIERS_EXTRA if base_dpi * x[0] >= HARD_MIN_DPI]
+    if gray:  # 已經是灰階, 『轉灰階』階梯與彩色階梯相同, 去除重複
+        out = [(s, lo, hi, False) for s, lo, hi, _ in out]
+    seen, uniq = set(), []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+
+def _search(pool, images, payload_budget, gray, tiers, bump):
+    """在 images (可能只是抽樣) 上找出『符合預算的最高畫質』設定。
+    回傳 dict(s, q, gray, data, imgs, fits)。"""
+    last = None
+    for s, qlo, qhi, g in tiers:
+        imgs = scale_all(pool, images, s)
+        g_eff = gray or g
+        if g and not gray:
+            imgs = list(pool.map(lambda im: im.convert("L"), imgs))
+        data = encode_all(pool, imgs, qhi)
+        bump()
+        if _payload(data) <= payload_budget:
+            return dict(s=s, q=qhi, gray=g_eff, data=data, imgs=imgs, fits=True)
+        data = encode_all(pool, imgs, qlo)
+        bump()
+        last = (s, qlo, g_eff, data, imgs)
+        if _payload(data) > payload_budget:
+            continue
+        best_q, best = qlo, data
+        lo, hi = qlo + 1, qhi - 1
+        while lo <= hi:  # 二分搜尋「仍符合預算的最高品質」
+            mid = (lo + hi) // 2
+            d = encode_all(pool, imgs, mid)
+            bump()
+            if _payload(d) <= payload_budget:
+                best_q, best, lo = mid, d, mid + 1
+            else:
+                hi = mid - 1
+        return dict(s=s, q=best_q, gray=g_eff, data=best, imgs=imgs, fits=True)
+    s, q, g_eff, data, imgs = last  # 全部階梯都超標: 取最後一階, 再壓一次
+    fq = min(q, FALLBACK_QUALITY)
+    if fq < q:
+        data = encode_all(pool, imgs, fq)
+        bump()
+    return dict(
+        s=s,
+        q=fq,
+        gray=g_eff,
+        data=data,
+        imgs=imgs,
+        fits=_payload(data) <= payload_budget,
+    )
+
+
+def _sample_indices(n, k):
+    if k >= n:
+        return list(range(n))
+    return sorted({round(j * (n - 1) / (k - 1)) for j in range(k)})
 
 
 def convert(
@@ -914,26 +1018,142 @@ def convert(
     quality=75,
     target_kb=None,
     gray=False,
+    target_first=True,
     cancel=None,
     log=print,
     progress=lambda f: None,
 ):
     """
     items: [(路徑, 頁索引清單或 None), ...] -> 單一輸出 PDF (PDF/圖片可混合 = 合併)。
-    target_kb=None -> 手動 (固定 dpi+quality); 數字 -> 自動逼近目標。回傳輸出 KB。
+    target_kb=None -> 手動 (固定 dpi+quality)
+    target_kb=數字 -> 自動逼近目標; target_first=True 時, 品質壓不下去會繼續降解析度/品質並轉灰階。
+    頁數少: 全部頁面放進記憶體精確搜尋; 頁數多: 抽樣估算 + 逐頁串流, 記憶體用量固定。
+    回傳輸出 KB。
     """
     cancel = cancel or threading.Event()
-    return _compress(
-        lambda: load_items(items, dpi, gray, cancel, progress),
-        dst,
-        dpi=dpi,
-        quality=quality,
-        target_kb=target_kb,
-        gray=gray,
-        cancel=cancel,
-        log=log,
-        progress=progress,
-    )
+    last = [0.0]
+
+    def prog(f):  # 進度只增不減
+        last[0] = max(last[0], min(1.0, f))
+        progress(last[0])
+
+    def mk_bump(base, span, steps=10):
+        cnt = [0]
+
+        def bump():
+            cnt[0] += 1
+            prog(base + span * min(1.0, cnt[0] / steps))
+            if cancel.is_set():
+                raise Cancelled
+
+        return bump
+
+    src = PageSource(items, cancel)
+    try:
+        n = len(src.pages)
+        prog(0.02)
+        with ThreadPoolExecutor(WORKERS) as pool:
+            if target_kb is None:  # ---- 手動: 固定參數, 逐頁串流 ----
+                jpegs, px, sizes = stream_encode(
+                    src,
+                    pool,
+                    dpi,
+                    quality,
+                    gray,
+                    cancel,
+                    lambda f: prog(0.02 + 0.96 * f),
+                )
+                final_gray = gray
+                log("  " + t("log.dpi_q", dpi=f"{dpi:.0f}", q=quality))
+            else:  # ---- 自動: 逼近目標大小 ----
+                budget = target_kb * 1024
+                overhead = 420 * n + 600
+                tiers = _tiers(dpi, gray, target_first)
+                k_max = int(
+                    max(
+                        6,
+                        min(
+                            SAMPLE_MAX_PAGES,
+                            SAMPLE_BYTES // max(1, src.avg_page_bytes(dpi, gray)),
+                        ),
+                    )
+                )
+                if n <= k_max:  # 頁數少: 全部渲染一次, 精確搜尋
+                    imgs, sizes = [], []
+                    for i in range(n):
+                        if cancel.is_set():
+                            raise Cancelled
+                        im, size = src.render(i, dpi, gray)
+                        imgs.append(im)
+                        sizes.append(size)
+                        prog(0.02 + 0.40 * (i + 1) / n)
+                    res = _search(
+                        pool, imgs, budget - overhead, gray, tiers, mk_bump(0.42, 0.54)
+                    )
+                    jpegs, px = res["data"], [im.size for im in res["imgs"]]
+                    ok = res["fits"]
+                    del imgs
+                else:  # 頁數多: 抽樣估算 -> 逐頁串流 -> 驗證, 必要時修正重試
+                    idx = _sample_indices(n, k_max)
+                    log("  " + t("log.sampling", n=n, k=len(idx)))
+                    sample = []
+                    for j, i in enumerate(idx):
+                        if cancel.is_set():
+                            raise Cancelled
+                        sample.append(src.render(i, dpi, gray)[0])
+                        prog(0.02 + 0.10 * (j + 1) / len(idx))
+                    margin = 0.93
+                    for attempt in range(1, MAX_ATTEMPTS + 1):
+                        sample_budget = (budget * margin - overhead) * len(idx) / n
+                        res = _search(
+                            pool,
+                            sample,
+                            sample_budget,
+                            gray,
+                            tiers,
+                            mk_bump(0.12, 0.10),
+                        )
+                        jpegs, px, sizes = stream_encode(
+                            src,
+                            pool,
+                            dpi * res["s"],
+                            res["q"],
+                            res["gray"],
+                            cancel,
+                            lambda f: prog(0.22 + 0.76 * f),
+                        )
+                        actual = estimated_pdf_size(jpegs)
+                        ok = actual <= budget
+                        if ok or not res["fits"] or attempt == MAX_ATTEMPTS:
+                            break
+                        margin *= budget / actual * 0.97  # 實際比預測大多少, 就多壓多少
+                        log(
+                            "  "
+                            + t(
+                                "log.retry",
+                                size=fmt_size(actual),
+                                i=attempt + 1,
+                                max=MAX_ATTEMPTS,
+                            )
+                        )
+                    del sample
+                final_gray = res["gray"]
+                eff_dpi = dpi * res["s"]
+                note = (t("log.gray_note") if final_gray and not gray else "") + (
+                    "" if ok else t("log.limit_note")
+                )
+                log("  " + t("log.dpi_q", dpi=f"{eff_dpi:.0f}", q=res["q"]) + note)
+                if target_first and (
+                    eff_dpi < MIN_DPI or res["q"] < 35 or (final_gray and not gray)
+                ):
+                    log("  " + t("log.low_quality"))
+            if cancel.is_set():
+                raise Cancelled
+            write_pdf(dst, jpegs, px, sizes, final_gray)
+    finally:
+        src.close()
+    progress(1.0)
+    return os.path.getsize(dst) / 1024
 
 
 def compress_pdf(src, dst, pages=None, **kw):
@@ -942,52 +1162,6 @@ def compress_pdf(src, dst, pages=None, **kw):
 
 def images_to_pdf(paths, dst, **kw):
     return convert([(p, None) for p in paths], dst, **kw)
-
-
-def _auto_search(pool, images, base_dpi, budget, cancel, progress):
-    steps = [s for s in DPI_STEPS if s == 1.0 or base_dpi * s >= MIN_DPI]
-    iters = 0
-
-    def bump():
-        nonlocal iters
-        iters += 1
-        progress(0.6 + 0.38 * min(1.0, iters / 8))
-        if cancel.is_set():
-            raise Cancelled
-
-    last = None
-    for s in steps:
-        imgs = scale_all(pool, images, s)
-        data = encode_all(pool, imgs, MAX_AUTO_QUALITY)
-        bump()
-        if estimated_pdf_size(data) <= budget:
-            return (
-                data,
-                imgs,
-                t("log.dpi_q", dpi=f"{base_dpi * s:.0f}", q=MAX_AUTO_QUALITY),
-            )
-        data = encode_all(pool, imgs, MIN_AUTO_QUALITY)
-        bump()
-        last = (data, imgs, s)
-        if estimated_pdf_size(data) > budget:
-            continue
-        best, best_q = data, MIN_AUTO_QUALITY
-        lo, hi = MIN_AUTO_QUALITY + 1, MAX_AUTO_QUALITY - 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            d = encode_all(pool, imgs, mid)
-            bump()
-            if estimated_pdf_size(d) <= budget:
-                best, best_q, lo = d, mid, mid + 1
-            else:
-                hi = mid - 1
-        return best, imgs, t("log.dpi_q", dpi=f"{base_dpi * s:.0f}", q=best_q)
-
-    data, imgs, s = last
-    data = encode_all(pool, imgs, PANIC_QUALITY)
-    bump()
-    note = "" if estimated_pdf_size(data) <= budget else t("log.limit_note")
-    return data, imgs, t("log.dpi_q", dpi=f"{base_dpi * s:.0f}", q=PANIC_QUALITY) + note
 
 
 def unique_path(path):
@@ -1358,7 +1532,21 @@ class App(ctk.CTk if ctk else object):
         self.gray_var = ctk.BooleanVar(value=self.cfg["gray"])
         ctk.CTkSwitch(
             sf, text=t("gray.switch"), variable=self.gray_var, font=F(13)
-        ).grid(row=14, column=0, sticky="w", pady=(6, 10), **P)
+        ).grid(row=14, column=0, sticky="w", pady=(6, 6), **P)
+        self.tfirst_var = ctk.BooleanVar(value=self.cfg["target_first"])
+        self.tfirst_switch = ctk.CTkSwitch(
+            sf, text=t("tfirst.switch"), variable=self.tfirst_var, font=F(13)
+        )
+        self.tfirst_switch.grid(row=15, column=0, sticky="w", pady=(4, 0), **P)
+        ctk.CTkLabel(
+            sf,
+            text=t("tfirst.hint"),
+            font=F(11),
+            justify="left",
+            wraplength=300,
+            text_color=("gray40", "gray65"),
+            anchor="w",
+        ).grid(row=16, column=0, sticky="w", pady=(0, 10), **P)
 
         bf = ctk.CTkFrame(rc, fg_color="transparent")
         bf.grid(row=2, column=0, sticky="ew", padx=18, pady=(8, 16))
@@ -1436,6 +1624,7 @@ class App(ctk.CTk if ctk else object):
         for b in self.preset_btns:
             b.configure(state="normal" if auto else "disabled")
         self.q_slider.configure(state="disabled" if auto else "normal")
+        self.tfirst_switch.configure(state="normal" if auto else "disabled")
 
     def _on_theme(self, label):
         key = next((k for k, v in theme_labels().items() if v == label), "system")
@@ -1493,6 +1682,7 @@ class App(ctk.CTk if ctk else object):
             quality=self.q_var.get(),
             auto=self._is_auto(),
             gray=self.gray_var.get(),
+            target_first=self.tfirst_var.get(),
             output_mode=self._output_mode(),
             split_n=split_n,
             merge_name=name,
@@ -1798,6 +1988,7 @@ class App(ctk.CTk if ctk else object):
             quality=self.cfg["quality"],
             target_kb=mb * 1024 if self.cfg["auto"] else None,
             gray=self.cfg["gray"],
+            target_first=self.cfg["target_first"],
         )
         self.running = True
         self.cancel.clear()
@@ -1829,6 +2020,23 @@ class App(ctk.CTk if ctk else object):
                     dst = unique_path(dst[:-4] + " (1).pdf")
                 used.add(dst)
                 prog = lambda f, i=idx: self.q.put(("progress", (i + f) / total))
+                if (
+                    job["compare"]
+                    and opts["target_kb"] is not None
+                    and os.path.getsize(job["src"]) <= opts["target_kb"] * 1024
+                ):
+                    # 原檔本來就已經達標: 不要為了「壓縮」反而把畫質弄差 (轉成圖片後檔案甚至可能變大)
+                    shutil.copy2(job["src"], dst)
+                    say(
+                        t(
+                            "run.already_small",
+                            size=fmt_size(os.path.getsize(job["src"])),
+                        )
+                    )
+                    self.q.put(("progress", (idx + 1) / total))
+                    self.last_out = folder
+                    ok += 1
+                    continue
                 size_kb = convert(
                     job["items"],
                     dst,

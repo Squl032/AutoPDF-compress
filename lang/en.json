@@ -56,7 +56,6 @@
         "msg.lang_busy": "Can't change the language while processing",
         "log.skipped": "Skipped {n} unsupported file(s)",
         "log.skipped_heif": " (for HEIC support: pip install pillow-heif)",
-        "log.mem_dpi": "Too many or too large pages; render DPI lowered to {dpi} to avoid running out of memory",
         "log.dpi_q": "DPI {dpi}, quality {q}",
         "log.limit_note": " (still over target; this is the limit)",
         "lang.load_failed": "Could not read language file {file}: {err}",
@@ -96,6 +95,13 @@
         "env.no_tk": "tkinter was not found, so no window can be shown.\n{hint}",
         "env.hint_linux": "Run: sudo apt install python3-tk",
         "env.hint_other": "Please reinstall Python and make sure the tcl/tk component is selected.",
-        "lang.skipped_bundled": "Language file(s) {files} share a code with a built-in language; the built-in (latest) version is used. To override, add \"override\": true to the file's _meta."
+        "lang.skipped_bundled": "Language file(s) {files} share a code with a built-in language; the built-in (latest) version is used. To override, add \"override\": true to the file's _meta.",
+        "log.sampling": "Many pages ({n}); sampling {k} pages to estimate settings",
+        "log.retry": "Actual size {size} is over the target; retrying with adjusted settings ({i}/{max})",
+        "log.gray_note": ", grayscale",
+        "log.low_quality": "⚠ Quality was lowered a lot to reach the target size; the content may be hard to read",
+        "tfirst.switch": "Prioritize target size",
+        "tfirst.hint": "Lower quality a lot and switch to grayscale if needed (off = keep a minimum quality)",
+        "run.already_small": "  The original ({size}) is already under the target size; copied as is, not recompressed"
     }
 }

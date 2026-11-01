@@ -21,6 +21,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "autopdf.py")
 LANG_DIR = os.path.join(HERE, "lang")
 YES = "--yes" in sys.argv
+DRY = "--dry-run" in sys.argv  # 只做檢查, 不真的打包
+
+# 選用套件: 打包時沒裝, exe 就不會有對應功能 (而且不會報錯, 使用者只會發現「功能不見了」)
+BUNDLE_OPTIONAL = [
+    ("tkinterdnd2", "tkinterdnd2", "拖曳檔案進視窗"),
+    ("pillow_heif", "pillow-heif", "HEIC / HEIF 圖片"),
+]
 
 
 def ask(question):
@@ -38,6 +45,31 @@ def main():
     if subprocess.call(cmd) != 0:
         print("環境檢查未通過, 已中止。")
         return 1
+
+    # 1.5) 選用套件: 沒裝的話 exe 會缺功能, 不受「不再詢問」設定影響, 這裡一定檢查
+    missing = [
+        (m, p, d) for m, p, d in BUNDLE_OPTIONAL if importlib.util.find_spec(m) is None
+    ]
+    if missing:
+        print("\n注意: 下列選用套件沒有安裝, 打包出來的 exe 會「沒有」對應功能:")
+        for _, p, d in missing:
+            print(f"  - {p}  ({d})")
+        if ask("要現在安裝它們嗎? (強烈建議)"):
+            rc = subprocess.call(
+                [sys.executable, "-m", "pip", "install", *[p for _, p, _ in missing]]
+            )
+            importlib.invalidate_caches()
+            missing = [
+                (m, p, d) for m, p, d in missing if importlib.util.find_spec(m) is None
+            ]
+            if rc != 0 or missing:
+                print("部分套件安裝失敗, exe 仍會缺少對應功能。")
+        else:
+            print("已略過, exe 將缺少上述功能。")
+    for m, p, d in BUNDLE_OPTIONAL:
+        print(f"  [{'OK' if importlib.util.find_spec(m) else '--'}] {p}: {d}")
+    if DRY:
+        return 0
 
     # 2) PyInstaller
     if importlib.util.find_spec("PyInstaller") is None:

@@ -56,7 +56,6 @@
         "msg.lang_busy": "处理中无法切换语言",
         "log.skipped": "跳过 {n} 个不支持的文件",
         "log.skipped_heif": " (想支持 HEIC 请 pip install pillow-heif)",
-        "log.mem_dpi": "页数/尺寸过大，为避免内存不足，渲染 DPI 自动降为 {dpi}",
         "log.dpi_q": "DPI {dpi}，质量 {q}",
         "log.limit_note": " (仍超过目标，已是极限)",
         "lang.load_failed": "语言文件 {file} 无法读取: {err}",
@@ -96,6 +95,13 @@
         "env.no_tk": "找不到 tkinter，无法显示窗口。\n{hint}",
         "env.hint_linux": "请执行: sudo apt install python3-tk",
         "env.hint_other": "请重新安装 Python，并确认勾选 tcl/tk 组件。",
-        "lang.skipped_bundled": "语言文件 {files} 与内置语言代码相同，已使用内置的最新版。要覆盖请在文件的 _meta 中加入 \"override\": true。"
+        "lang.skipped_bundled": "语言文件 {files} 与内置语言代码相同，已使用内置的最新版。要覆盖请在文件的 _meta 中加入 \"override\": true。",
+        "log.sampling": "页数较多 ({n} 页)，先抽样 {k} 页估算压缩设置",
+        "log.retry": "实际大小 {size} 超过目标，调整后重试 ({i}/{max})",
+        "log.gray_note": "，灰度",
+        "log.low_quality": "⚠ 为达成目标大小已大幅降低画质，内容可能难以阅读",
+        "tfirst.switch": "优先达成目标大小",
+        "tfirst.hint": "必要时大幅降低画质并自动转灰度 (关闭则保留最低画质)",
+        "run.already_small": "  原文件 ({size}) 已小于目标大小，直接复制，不重新压缩"
     }
 }
