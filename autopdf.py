@@ -642,6 +642,11 @@ MEMORY_LIMIT = 1.2 * 1024**3
 WORKERS = max(1, os.cpu_count() or 1)
 A4_PT = (595.28, 841.89)
 
+NO_DND = "--no-dnd" in sys.argv  # 診斷用: 停用拖曳, 用來判斷介面異常是否與拖曳套件有關
+# Windows 上 CustomTkinter 啟動時會自己隱藏/重顯示視窗, 第一次建好的介面偶爾有元件沒畫出來,
+# 所以啟動後重建一次 (和切換語言走同一條路徑)。其他系統不需要。
+FIRST_RUN_REFRESH = sys.platform.startswith("win")
+
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 if HEIF_OK:
     IMAGE_EXTS |= {".heic", ".heif"}
@@ -1063,7 +1068,8 @@ class App(ctk.CTk if ctk else object):
         self.running = False
         self.last_out = ""
         self.dnd_active = False
-        self._dnd_loaded = False
+        self.dnd_error = ""
+        self._dnd_ready = self._load_dnd()  # 先載入 tkdnd, 再建元件
         self.header = self.left = self.right = None
 
         self.grid_columnconfigure(0, weight=1)
@@ -1073,7 +1079,6 @@ class App(ctk.CTk if ctk else object):
         self.main.grid_columnconfigure(0, weight=1)
         self.main.grid_columnconfigure(1, weight=0)
         self.main.grid_rowconfigure(1, weight=1)
-        self.dnd_error = ""
         self._build_ui()
         for fn, err in I18N_.errors:
             self.log(t("lang.load_failed", file=fn, err=err))
@@ -1085,6 +1090,8 @@ class App(ctk.CTk if ctk else object):
             self.log(t("dnd.admin"))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(80, self._poll)
+        if FIRST_RUN_REFRESH:
+            self.after(350, self._post_start_refresh)
 
     def _build_ui(self):
         """建立 (或在切換語言時重建) 整個介面。狀態都存在 self.cfg / self.files / self.ranges。"""
@@ -1101,17 +1108,26 @@ class App(ctk.CTk if ctk else object):
         self._apply_output_mode()
 
     # ---------- 拖曳 ----------
-    def _setup_dnd(self):
+    def _load_dnd(self):
+        """載入 tkdnd (只做一次, 且必須在建立元件之前)。"""
+        if NO_DND:
+            self.dnd_error = "disabled by --no-dnd"
+            return False
         if not DND_OK:
             self.dnd_error = DND_ERR
             return False
         try:
-            if not self._dnd_loaded:
-                require = getattr(TkinterDnD, "require", None) or TkinterDnD._require
-                require(
-                    self
-                )  # 載入 tkdnd; 根視窗本身不能註冊, 改註冊在容器與其所有子元件上
-                self._dnd_loaded = True
+            require = getattr(TkinterDnD, "require", None) or TkinterDnD._require
+            require(self)  # 根視窗本身不能註冊拖放, 之後改註冊在容器與其所有子元件上
+            return True
+        except Exception as e:
+            self.dnd_error = str(e) or type(e).__name__
+            return False
+
+    def _setup_dnd(self):
+        if not self._dnd_ready:
+            return False
+        try:
             self._register_dnd_tree(self.main)
             return True
         except Exception as e:
@@ -1435,10 +1451,15 @@ class App(ctk.CTk if ctk else object):
             messagebox.showinfo(t("msg.error"), t("msg.lang_busy"))
             return
         self._collect_cfg()
-        log_text = self.log_box.get("1.0", "end-1c")
-        prog, pct = self.progress.get(), self.pct_label.cget("text")
         self.cfg["language"] = I18N_.set(code)
         save_settings(self.cfg)
+        self._rebuild_preserving()
+
+    def _rebuild_preserving(self):
+        """重建整個介面並保留: 設定值、檔案清單、頁碼範圍、記錄區文字與進度。"""
+        self._collect_cfg()
+        log_text = self.log_box.get("1.0", "end-1c")
+        prog, pct = self.progress.get(), self.pct_label.cget("text")
         self._build_ui()
         self.log_box.configure(state="normal")
         self.log_box.insert("end", log_text)
@@ -1446,6 +1467,13 @@ class App(ctk.CTk if ctk else object):
         self.log_box.configure(state="disabled")
         self.progress.set(prog)
         self.pct_label.configure(text=pct)
+
+    def _post_start_refresh(self):
+        if not self.running:
+            try:
+                self._rebuild_preserving()
+            except Exception:
+                pass  # 重繪失敗不影響使用
 
     def _collect_cfg(self):
         try:

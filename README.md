@@ -37,6 +37,7 @@ Linux 需另外安裝 tkinter：`sudo apt install python3-tk`（這個無法用 
 | `python autopdf.py --yes`          | 缺少的套件直接安裝，不詢問（也會補裝先前選擇「否」的選用套件） |
 | `python autopdf.py --no-env-check` | 略過檢查                                                       |
 | `python autopdf.py --list-lang`    | 列出目前實際載入的語言                                         |
+| `python autopdf.py --no-dnd`       | 停用拖曳功能（診斷用：判斷介面異常是否與拖曳套件有關）         |
 | `python autopdf.py --export-lang`  | 產生 `lang/_template.json` 翻譯範本                            |
 
 - **必要套件**：customtkinter、pypdfium2、pillow。缺少就無法執行。
