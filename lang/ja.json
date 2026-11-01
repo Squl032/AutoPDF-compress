@@ -81,6 +81,21 @@
         "err.range_empty": "ページが選択されていません",
         "err.no_pagecount_range": "ページ数を取得できないため、ページ範囲を適用できません",
         "err.no_pagecount_split": "ページ数を取得できません (パスワード保護の可能性)。分割できません",
-        "cli.no_ctk": "customtkinter がありません。先に pip install -r requirements.txt を実行してください"
+        "cli.no_ctk": "customtkinter がありません。先に pip install -r requirements.txt を実行してください",
+        "dnd.unavailable": "ドラッグ＆ドロップを使用できません ({err})。tkinterdnd2 がインストールされているか確認してください (pip install tkinterdnd2)。",
+        "dnd.admin": "管理者権限で実行中のため、Windows がエクスプローラーからのドラッグを遮断します。通常の権限で起動し直すか、「＋ ファイルを追加」をご利用ください。",
+        "env.title": "環境チェック",
+        "env.required": "必須パッケージ (ないと実行できません):",
+        "env.optional": "オプションのパッケージ (ドラッグ＆ドロップ、HEIC 画像対応):",
+        "env.ask": "今すぐ自動でインストールしますか？ (インターネット接続が必要です)",
+        "env.installing_title": "パッケージをインストール中",
+        "env.installing": "インストール中: {pkgs}\nしばらくお待ちください。完了後に自動で起動します...",
+        "env.install_failed": "パッケージのインストールに失敗しました:\n\n{err}\n\n次のコマンドを手動で実行してください:\n{cmd}",
+        "env.optional_failed": "オプションのパッケージをインストールできなかったためスキップしました (主な機能には影響しません):\n{pkgs}\n\n今後は確認しません。",
+        "env.declined": "必須パッケージが未インストールのため、実行できません。\n手動インストールのコマンド:\n{cmd}",
+        "env.no_tk": "tkinter が見つからないため、ウィンドウを表示できません。\n{hint}",
+        "env.hint_linux": "次を実行してください: sudo apt install python3-tk",
+        "env.hint_other": "Python を再インストールし、tcl/tk コンポーネントを選択してください。",
+        "lang.skipped_bundled": "言語ファイル {files} は内蔵言語と同じコードのため、内蔵 (最新) 版を使用しています。上書きするにはファイルの _meta に \"override\": true を追加してください。"
     }
 }

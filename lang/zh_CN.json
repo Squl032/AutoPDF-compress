@@ -81,6 +81,21 @@
         "err.range_empty": "没有选到任何页面",
         "err.no_pagecount_range": "读不到页数，无法应用页码范围",
         "err.no_pagecount_split": "读不到页数 (可能有密码)，无法拆分",
-        "cli.no_ctk": "缺少 customtkinter，请先执行: pip install -r requirements.txt"
+        "cli.no_ctk": "缺少 customtkinter，请先执行: pip install -r requirements.txt",
+        "dnd.unavailable": "拖放功能不可用 ({err})，请确认已安装 tkinterdnd2 (pip install tkinterdnd2)。",
+        "dnd.admin": "当前以管理员身份运行，Windows 会阻止从资源管理器拖入文件。请改用普通权限打开程序 (或使用「＋ 添加文件」)。",
+        "env.title": "环境检查",
+        "env.required": "必要软件包 (缺少就无法运行):",
+        "env.optional": "可选软件包 (拖放文件、HEIC 图片支持):",
+        "env.ask": "要现在自动安装吗? (需要联网)",
+        "env.installing_title": "正在安装软件包",
+        "env.installing": "正在安装: {pkgs}\n请稍候，完成后会自动启动程序...",
+        "env.install_failed": "软件包安装失败:\n\n{err}\n\n请手动执行:\n{cmd}",
+        "env.optional_failed": "可选软件包安装失败，已跳过 (不影响主要功能):\n{pkgs}\n\n之后不会再询问。",
+        "env.declined": "未安装必要软件包，程序无法运行。\n手动安装命令:\n{cmd}",
+        "env.no_tk": "找不到 tkinter，无法显示窗口。\n{hint}",
+        "env.hint_linux": "请执行: sudo apt install python3-tk",
+        "env.hint_other": "请重新安装 Python，并确认勾选 tcl/tk 组件。",
+        "lang.skipped_bundled": "语言文件 {files} 与内置语言代码相同，已使用内置的最新版。要覆盖请在文件的 _meta 中加入 \"override\": true。"
     }
 }

@@ -7,7 +7,8 @@ AutoPDF-compress (改良版)
 - 合併: 清單中的 PDF 與圖片可依序接成一個 PDF; 拆分: 每個 PDF 依頁數切成多個檔案
 - 每個 PDF 可單獨指定頁碼範圍, 例如 1-3,5,8-
 - 拖曳檔案/資料夾進視窗
-- 多語言: 讀取 lang/ 資料夾內的 .json, 檔案有幾個就有幾種語言可選 (exe 亦適用)
+- 多語言: 讀取 lang/ 資料夾內的 .json, 有幾個檔就有幾種語言 (exe 內建最新語言, 旁邊的 lang/ 可再新增)
+- 啟動前自動檢查套件, 缺少時可一鍵 pip 安裝 (python autopdf.py --check-env 可手動檢查)
 - 自動模式: 設定目標大小, 程式用二分搜尋 JPEG 品質逼近目標, 不夠才降解析度
 - 不需要 Poppler: 使用 pypdfium2 渲染, pip 即可安裝
 - 記住上次的所有設定 (輸出資料夾、DPI、模式、主題…)
@@ -16,54 +17,17 @@ AutoPDF-compress (改良版)
 注意: 輸出是「圖片式 PDF」, 原本可選取/搜尋的文字會消失。
 """
 
+import importlib.util
 import io
 import json
 import math
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
-
-import pypdfium2 as pdfium
-from PIL import Image, ImageOps
-
-try:  # 選用: 支援 iPhone 的 HEIC / HEIF
-    import pillow_heif
-
-    pillow_heif.register_heif_opener()
-    HEIF_OK = True
-except Exception:
-    HEIF_OK = False
-
-try:  # 選用: 拖曳檔案進視窗
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-
-    DND_OK, DND_ERR = True, ""
-except Exception as _e:
-    DND_OK, DND_ERR = False, str(_e) or type(_e).__name__
-
-try:  # GUI 套件缺少時仍可 import 核心函式
-    import customtkinter as ctk
-    from tkinter import filedialog, messagebox
-except ImportError:
-    ctk = None
-
-# ----------------------------- 可調參數 -----------------------------
-MAX_AUTO_QUALITY = 90  # 自動模式品質上限
-MIN_AUTO_QUALITY = 50  # 自動模式先保證品質 >= 此值, 不夠才降解析度
-PANIC_QUALITY = 35  # 所有手段用盡後的最後一搏
-MIN_DPI = 72
-DPI_STEPS = (1.0, 0.85, 0.7, 0.6, 0.5)
-MEMORY_LIMIT = 1.2 * 1024**3
-WORKERS = max(1, os.cpu_count() or 1)
-A4_PT = (595.28, 841.89)
-
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
-if HEIF_OK:
-    IMAGE_EXTS |= {".heic", ".heif"}
-SUPPORTED_EXTS = IMAGE_EXTS | {".pdf"}
 
 
 class Cancelled(Exception):
@@ -156,6 +120,19 @@ DEFAULT_STRINGS = {
     "err.no_pagecount_split": "讀不到頁數 (可能有密碼), 無法拆分",
     "dnd.unavailable": "拖曳功能無法使用 ({err}), 請確認已安裝 tkinterdnd2 (pip install tkinterdnd2)",
     "dnd.admin": "目前以系統管理員身分執行, Windows 會阻擋從檔案總管拖曳檔案進來。請改用一般權限開啟程式 (或使用「＋ 添加檔案」)。",
+    "env.title": "環境檢查",
+    "env.required": "必要套件 (缺少就無法執行):",
+    "env.optional": "選用套件 (拖曳檔案、HEIC 圖片支援):",
+    "env.ask": "要現在自動安裝嗎? (需要網路連線)",
+    "env.installing_title": "安裝套件中",
+    "env.installing": "正在安裝: {pkgs}\n請稍候, 完成後會自動啟動程式...",
+    "env.install_failed": "套件安裝失敗:\n\n{err}\n\n請手動執行:\n{cmd}",
+    "env.optional_failed": "選用套件安裝失敗, 已略過 (不影響主要功能):\n{pkgs}\n\n之後不會再詢問。",
+    "env.declined": "未安裝必要套件, 程式無法執行。\n手動安裝指令:\n{cmd}",
+    "env.no_tk": "找不到 tkinter, 無法顯示視窗。\n{hint}",
+    "env.hint_linux": "請執行: sudo apt install python3-tk",
+    "env.hint_other": "請重新安裝 Python, 並確認勾選 tcl/tk 元件。",
+    "lang.skipped_bundled": '語言檔 {files} 與 exe 內建語言同代碼, 已使用內建的最新版 (要覆蓋請在檔案的 _meta 加上 "override": true)',
     "cli.no_ctk": "缺少 customtkinter, 請先執行: pip install -r requirements.txt",
 }
 
@@ -167,18 +144,20 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def lang_dirs():
-    """可能存放 lang/ 的位置, 依優先順序: 程式旁 > 打包內建 > 目前工作目錄。"""
-    cands = [os.path.join(app_dir(), "lang")]
+def lang_sources():
+    """回傳 [(資料夾, 是否為內建)], 依優先順序。
+    內建 = 打包進 exe 的 lang (最新版, 優先); 外部 = exe/腳本旁邊與目前工作目錄的 lang。"""
+    cands = []
     if getattr(sys, "frozen", False) and getattr(sys, "_MEIPASS", None):
-        cands.append(os.path.join(sys._MEIPASS, "lang"))
-    cands.append(os.path.join(os.getcwd(), "lang"))
+        cands.append((os.path.join(sys._MEIPASS, "lang"), True))
+    cands.append((os.path.join(app_dir(), "lang"), False))
+    cands.append((os.path.join(os.getcwd(), "lang"), False))
     seen, out = set(), []
-    for d in cands:
+    for d, bundled in cands:
         key = os.path.normcase(os.path.realpath(d))
         if key not in seen and os.path.isdir(d):
             seen.add(key)
-            out.append(d)
+            out.append((d, bundled))
     return out
 
 
@@ -208,50 +187,77 @@ class I18N:
     def __init__(self):
         self.langs = {}  # 代碼 -> {"name", "strings", "font", "path"}
         self.errors = []  # [(檔名, 錯誤訊息)]
+        self.skipped = []  # 與內建語言同代碼而被忽略的外部檔
         self.code = DEFAULT_LANG
         self.scan()
 
+    @staticmethod
+    def _parse(path, stem):
+        with open(path, encoding="utf-8-sig") as f:  # utf-8-sig: 相容記事本存的 BOM
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("top level must be a JSON object")
+        meta = data.get("_meta") if isinstance(data.get("_meta"), dict) else {}
+        raw = data.get("strings")
+        if not isinstance(raw, dict):  # 容錯: 允許不包 "strings", 直接平鋪
+            raw = {k: v for k, v in data.items() if not k.startswith("_")}
+        strings = {k: v for k, v in raw.items() if isinstance(v, str)}
+        if not strings:
+            raise ValueError("no usable translation strings")
+        return {
+            "name": str(meta.get("name") or stem),
+            "named": bool(meta.get("name")),
+            "strings": strings,
+            "font": str(meta.get("font") or ""),
+            "path": path,
+            "override": bool(meta.get("override")),
+            "bundled": False,
+        }
+
     def scan(self):
-        self.langs, self.errors = {}, []
-        for d in lang_dirs():
+        """exe: 先載入內建語言, 外部 lang/ 只『新增』內建沒有的語言 (同代碼預設忽略,
+        除非外部檔 _meta 寫 "override": true, 則以內建為底、疊上外部的文字)。
+        腳本模式: 直接讀 lang/ 資料夾, 有幾個 json 就有幾種語言。"""
+        self.langs, self.errors, self.skipped = {}, [], []
+        bundled_codes = set()
+        for d, bundled in lang_sources():
             for fn in sorted(os.listdir(d)):
                 stem, ext = os.path.splitext(fn)
-                if ext.lower() != ".json" or stem.startswith("_") or stem in self.langs:
+                if ext.lower() != ".json" or stem.startswith("_"):
                     continue
-                path = os.path.join(d, fn)
                 try:
-                    with open(
-                        path, encoding="utf-8-sig"
-                    ) as f:  # utf-8-sig: 相容記事本存的 BOM
-                        data = json.load(f)
-                    if not isinstance(data, dict):
-                        raise ValueError("top level must be a JSON object")
-                    meta = (
-                        data.get("_meta") if isinstance(data.get("_meta"), dict) else {}
-                    )
-                    raw = data.get("strings")
-                    if not isinstance(raw, dict):  # 容錯: 允許不包 "strings", 直接平鋪
-                        raw = {k: v for k, v in data.items() if not k.startswith("_")}
-                    strings = {k: v for k, v in raw.items() if isinstance(v, str)}
-                    if not strings:
-                        raise ValueError("no usable translation strings")
-                    self.langs[stem] = {
-                        "name": str(meta.get("name") or stem),
-                        "strings": strings,
-                        "font": str(meta.get("font") or ""),
-                        "path": path,
-                    }
+                    entry = self._parse(os.path.join(d, fn), stem)
                 except (
                     OSError,
                     ValueError,
                 ) as e:  # JSONDecodeError 是 ValueError 的子類
                     self.errors.append((fn, str(e)))
+                    continue
+                if stem in self.langs:
+                    if stem in bundled_codes and not bundled:
+                        if entry["override"]:
+                            old = self.langs[stem]
+                            old["strings"] = {**old["strings"], **entry["strings"]}
+                            if entry["named"]:
+                                old["name"] = entry["name"]
+                            if entry["font"]:
+                                old["font"] = entry["font"]
+                        else:
+                            self.skipped.append(fn)
+                    continue  # 其餘情況: 同代碼先到先得
+                entry["bundled"] = bundled
+                self.langs[stem] = entry
+                if bundled:
+                    bundled_codes.add(stem)
         if DEFAULT_LANG not in self.langs:  # 內建語言永遠可用
             self.langs[DEFAULT_LANG] = {
                 "name": "繁體中文",
                 "strings": {},
                 "font": "",
                 "path": "",
+                "override": False,
+                "named": True,
+                "bundled": True,
             }
         self.langs = dict(sorted(self.langs.items()))
         if self.code not in self.langs:
@@ -325,7 +331,8 @@ DEFAULTS = {
     "target_mb": 4.0,
     "gray": False,
     "theme": "system",
-    "language": "",  # language 空字串 = 依系統語言
+    "language": "",
+    "skip_optional_packages": False,  # language 空字串 = 依系統語言
     "output_mode": "each",  # each=各自輸出 / merge=合併成一個 / split=拆分頁面
     "split_n": 1,
     "merge_name": "merged",
@@ -363,6 +370,282 @@ def save_settings(cfg):
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except OSError:
         pass  # 存不了設定不該讓程式壞掉
+
+
+# ----------------------------- 環境檢查 -----------------------------
+# 直接執行 .py 時, 在匯入第三方套件之前先檢查; 缺少就詢問是否自動 pip 安裝。
+# 打包成 exe 後套件都已內建, 不會執行這段。
+REQUIRED_PKGS = [
+    ("customtkinter", "customtkinter>=5.2.0"),
+    ("pypdfium2", "pypdfium2"),
+    ("PIL", "pillow"),
+]
+OPTIONAL_PKGS = [("pillow_heif", "pillow-heif"), ("tkinterdnd2", "tkinterdnd2")]
+
+
+def _pkg_missing(pkgs):
+    return [spec for mod, spec in pkgs if importlib.util.find_spec(mod) is None]
+
+
+def _pip_name(spec):
+    return re.split(r"[<>=!~\s]", spec, 1)[0]
+
+
+def _pkg_version(spec):
+    try:
+        from importlib import metadata
+
+        return metadata.version(_pip_name(spec))
+    except Exception:
+        return None
+
+
+def _manual_cmd(specs):
+    return f'"{sys.executable}" -m pip install ' + " ".join(f'"{s}"' for s in specs)
+
+
+def _run_pip(specs):
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        *specs,
+    ]
+    kw = (
+        {"creationflags": 0x08000000} if sys.platform.startswith("win") else {}
+    )  # 不跳黑視窗
+    try:
+        p = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **kw,
+        )
+        return p.returncode == 0, ((p.stderr or "") + (p.stdout or "")).strip()[-700:]
+    except Exception as e:
+        return False, str(e)
+
+
+def _tk_root():
+    try:
+        import tkinter as tk_
+
+        r = tk_.Tk()
+        r.withdraw()
+        return tk_, r
+    except Exception:
+        return None, None
+
+
+def _dialog(kind, title, msg):
+    """kind: info / error / yesno。沒有視窗環境時退回主控台。"""
+    tk_, r = _tk_root()
+    if r is not None:
+        try:
+            from tkinter import messagebox as mb
+
+            r.attributes("-topmost", True)
+            fn = {"info": mb.showinfo, "error": mb.showerror, "yesno": mb.askyesno}[
+                kind
+            ]
+            return fn(title, msg, parent=r)
+        except Exception:
+            pass
+        finally:
+            try:
+                r.destroy()
+            except Exception:
+                pass
+    print(f"\n[{title}]\n{msg}")
+    if kind == "yesno":
+        try:
+            return input("[Y/n] ").strip().lower() in ("", "y", "yes", "是")
+        except EOFError:
+            return False
+    return None
+
+
+def _install_steps(steps):
+    """steps: [(名稱, [套件規格])], 依序 pip 安裝並顯示進度視窗。必要套件失敗就不再繼續。"""
+    results = {}
+
+    def work():
+        for name, specs in steps:
+            ok, out = _run_pip(specs)
+            results[name] = (ok, out)
+            if not ok and name == "req":
+                break
+
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    tk_, r = _tk_root()
+    if r is not None:
+        try:
+            from tkinter import ttk as ttk_
+
+            r.deiconify()
+            r.title(t("env.installing_title"))
+            r.resizable(False, False)
+            pkgs = ", ".join(sp for _, specs in steps for sp in specs)
+            tk_.Label(
+                r, text=t("env.installing", pkgs=pkgs), justify="left", padx=22, pady=14
+            ).pack()
+            pb = ttk_.Progressbar(r, mode="indeterminate", length=340)
+            pb.pack(padx=22, pady=(0, 18))
+            pb.start(12)
+
+            def poll():
+                if th.is_alive():
+                    r.after(150, poll)
+                else:
+                    r.destroy()
+
+            r.after(150, poll)
+            r.mainloop()
+        except Exception:
+            pass
+    else:
+        print(
+            t(
+                "env.installing",
+                pkgs=", ".join(sp for _, specs in steps for sp in specs),
+            )
+        )
+    th.join()
+    return results
+
+
+def ensure_environment(auto=False, report=False):
+    """檢查執行環境。缺少套件時詢問 (auto=True 則直接安裝)。回傳 True = 可以繼續執行。"""
+    cfg = load_settings()
+    I18N_.set(cfg["language"])
+    if importlib.util.find_spec("tkinter") is None:
+        hint = (
+            t("env.hint_linux")
+            if sys.platform.startswith("linux")
+            else t("env.hint_other")
+        )
+        print(t("env.no_tk", hint=hint))
+        return False
+
+    req = _pkg_missing(REQUIRED_PKGS)
+    # --yes 會無視「不再詢問」, 方便之後想補裝選用套件時使用
+    opt = (
+        []
+        if (cfg.get("skip_optional_packages") and not auto)
+        else _pkg_missing(OPTIONAL_PKGS)
+    )
+    if req or opt:
+        parts = []
+        if req:
+            parts.append(t("env.required") + "\n" + "\n".join("  • " + x for x in req))
+        if opt:
+            parts.append(t("env.optional") + "\n" + "\n".join("  • " + x for x in opt))
+        msg = "\n\n".join(parts) + "\n\n" + t("env.ask")
+        if auto or _dialog("yesno", t("env.title"), msg):
+            res = _install_steps([x for x in (("req", req), ("opt", opt)) if x[1]])
+            importlib.invalidate_caches()
+            if req and not res.get("req", (False, ""))[0]:
+                _dialog(
+                    "error",
+                    t("env.title"),
+                    t(
+                        "env.install_failed",
+                        err=res.get("req", (False, ""))[1],
+                        cmd=_manual_cmd(req),
+                    ),
+                )
+                return False
+            if opt and not res.get("opt", (False, ""))[0]:
+                _dialog(
+                    "info",
+                    t("env.title"),
+                    t("env.optional_failed", pkgs=", ".join(opt)),
+                )
+                cfg["skip_optional_packages"] = True
+                save_settings(cfg)
+        elif req:
+            _dialog("error", t("env.title"), t("env.declined", cmd=_manual_cmd(req)))
+            return False
+        else:  # 只缺選用套件而使用者選「否」: 記住, 之後不再詢問
+            cfg["skip_optional_packages"] = True
+            save_settings(cfg)
+
+    still = _pkg_missing(REQUIRED_PKGS)
+    if still:
+        _dialog(
+            "error",
+            t("env.title"),
+            t("env.install_failed", err="import failed", cmd=_manual_cmd(still)),
+        )
+        return False
+    if report:
+        print(f"Python {sys.version.split()[0]} ({sys.executable})")
+        for mod, spec in REQUIRED_PKGS + OPTIONAL_PKGS:
+            ver = _pkg_version(spec) if importlib.util.find_spec(mod) else None
+            kind = "required" if (mod, spec) in REQUIRED_PKGS else "optional"
+            print(
+                f"  [{'OK' if ver or importlib.util.find_spec(mod) else '--'}] "
+                f"{_pip_name(spec)} {ver or ''} ({kind})".rstrip()
+            )
+    return True
+
+
+if __name__ == "__main__" and not getattr(sys, "frozen", False):
+    if "--export-lang" in sys.argv:
+        print(export_lang_template())
+        sys.exit(0)
+    if "--no-env-check" not in sys.argv:
+        if not ensure_environment(
+            auto="--yes" in sys.argv, report="--check-env" in sys.argv
+        ):
+            sys.exit(1)
+    if "--check-env" in sys.argv:
+        sys.exit(0)
+
+
+import pypdfium2 as pdfium
+from PIL import Image, ImageOps
+
+try:  # 選用: 支援 iPhone 的 HEIC / HEIF
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+    HEIF_OK = True
+except Exception:
+    HEIF_OK = False
+
+try:  # 選用: 拖曳檔案進視窗
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+
+    DND_OK, DND_ERR = True, ""
+except Exception as _e:
+    DND_OK, DND_ERR = False, str(_e) or type(_e).__name__
+
+try:  # GUI 套件缺少時仍可 import 核心函式
+    import customtkinter as ctk
+    from tkinter import filedialog, messagebox
+except ImportError:
+    ctk = None
+
+# ----------------------------- 可調參數 -----------------------------
+MAX_AUTO_QUALITY = 90  # 自動模式品質上限
+MIN_AUTO_QUALITY = 50  # 自動模式先保證品質 >= 此值, 不夠才降解析度
+PANIC_QUALITY = 35  # 所有手段用盡後的最後一搏
+MIN_DPI = 72
+DPI_STEPS = (1.0, 0.85, 0.7, 0.6, 0.5)
+MEMORY_LIMIT = 1.2 * 1024**3
+WORKERS = max(1, os.cpu_count() or 1)
+A4_PT = (595.28, 841.89)
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+if HEIF_OK:
+    IMAGE_EXTS |= {".heic", ".heif"}
+SUPPORTED_EXTS = IMAGE_EXTS | {".pdf"}
 
 
 # ----------------------------- 核心 -----------------------------
@@ -794,6 +1077,8 @@ class App(ctk.CTk if ctk else object):
         self._build_ui()
         for fn, err in I18N_.errors:
             self.log(t("lang.load_failed", file=fn, err=err))
+        if getattr(sys, "frozen", False) and I18N_.skipped:
+            self.log(t("lang.skipped_bundled", files=", ".join(I18N_.skipped)))
         if not self.dnd_active:  # 拖曳不能用時, 直接在記錄區說明原因
             self.log(t("dnd.unavailable", err=self.dnd_error or DND_ERR or "?"))
         elif is_admin():
@@ -1564,6 +1849,15 @@ class App(ctk.CTk if ctk else object):
 
 
 def main():
+    if "--list-lang" in sys.argv:  # 診斷: 目前實際載入了哪些語言
+        for code, info in I18N_.langs.items():
+            src = "bundled" if info.get("bundled") else (info["path"] or "built-in")
+            print(f"{code}\t{info['name']}\t{len(info['strings'])} strings\t{src}")
+        for fn in I18N_.skipped:
+            print(f"skipped (same code as bundled): {fn}")
+        for fn, err in I18N_.errors:
+            print(f"error: {fn}: {err}")
+        return
     if "--export-lang" in sys.argv:  # 給翻譯者: python autopdf.py --export-lang
         print(export_lang_template())
         return

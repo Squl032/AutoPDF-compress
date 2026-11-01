@@ -81,6 +81,21 @@
         "err.range_empty": "No pages selected",
         "err.no_pagecount_range": "Can't read the page count, so the page range can't be applied",
         "err.no_pagecount_split": "Can't read the page count (password-protected?), so it can't be split",
-        "cli.no_ctk": "customtkinter is missing. Run: pip install -r requirements.txt"
+        "cli.no_ctk": "customtkinter is missing. Run: pip install -r requirements.txt",
+        "dnd.unavailable": "Drag and drop is unavailable ({err}). Make sure tkinterdnd2 is installed (pip install tkinterdnd2).",
+        "dnd.admin": "Running as administrator: Windows blocks dragging files in from Explorer. Restart the app without admin rights (or use \"+ Add files\").",
+        "env.title": "Environment check",
+        "env.required": "Required packages (the app can't run without them):",
+        "env.optional": "Optional packages (drag & drop, HEIC image support):",
+        "env.ask": "Install them automatically now? (internet connection required)",
+        "env.installing_title": "Installing packages",
+        "env.installing": "Installing: {pkgs}\nPlease wait. The app will start automatically when done...",
+        "env.install_failed": "Package installation failed:\n\n{err}\n\nPlease run manually:\n{cmd}",
+        "env.optional_failed": "Optional packages could not be installed and were skipped (main features are unaffected):\n{pkgs}\n\nYou won't be asked again.",
+        "env.declined": "Required packages are not installed, so the app can't run.\nManual install command:\n{cmd}",
+        "env.no_tk": "tkinter was not found, so no window can be shown.\n{hint}",
+        "env.hint_linux": "Run: sudo apt install python3-tk",
+        "env.hint_other": "Please reinstall Python and make sure the tcl/tk component is selected.",
+        "lang.skipped_bundled": "Language file(s) {files} share a code with a built-in language; the built-in (latest) version is used. To override, add \"override\": true to the file's _meta."
     }
 }
