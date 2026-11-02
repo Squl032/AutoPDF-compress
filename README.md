@@ -165,4 +165,6 @@ python autopdf.py --compress 輸入.pdf 輸出.pdf --target-mb 4 --workers 4
 
 ## 授權
 
-MIT。原專案版權屬原作者，請保留原作者署名。
+本專案改自 [eason9709/AutoPDF-compress](https://github.com/eason9709/AutoPDF-compress)（MIT，版權屬原作者，請保留原作者署名，MIT 全文見 [LICENSE-MIT](LICENSE-MIT)）。
+
+v1.0.1 之後發布的版本中，本專案的修改與新增內容採用 [PolyForm Noncommercial 1.0.0](LICENSE)：可免費用於個人、學習、研究等非商業用途，**不得用於商業用途**。v1.0.1（含）以前已發布的版本仍依 MIT 授權。
