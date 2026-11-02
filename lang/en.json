@@ -102,6 +102,13 @@
         "log.low_quality": "⚠ Quality was lowered a lot to reach the target size; the content may be hard to read",
         "tfirst.switch": "Prioritize target size",
         "tfirst.hint": "Lower quality a lot and switch to grayscale if needed (off = keep a minimum quality)",
-        "run.already_small": "  The original ({size}) is already under the target size; copied as is, not recompressed"
+        "run.already_small": "  The original ({size}) is already under the target size; copied as is, not recompressed",
+        "perf.label": "Performance mode",
+        "perf.eco": "Eco",
+        "perf.balanced": "Balanced",
+        "perf.fast": "Fast",
+        "perf.hint": "Detected {cores} cores, {total} RAM ({avail} available). This mode runs up to {w} processes in parallel, using about {mem} extra memory; faster for many pages.",
+        "perf.hint_single": "Detected {cores} cores, {total} RAM ({avail} available). This mode uses a single process (lowest resource use).",
+        "log.parallel": "Processing in parallel with {w} processes"
     }
 }

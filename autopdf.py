@@ -22,6 +22,7 @@ import importlib.util
 import io
 import json
 import math
+import multiprocessing
 import os
 import queue
 import re
@@ -29,7 +30,7 @@ import shutil
 import subprocess
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 
 class Cancelled(Exception):
@@ -99,6 +100,13 @@ DEFAULT_STRINGS = {
     "log.retry": "實際大小 {size} 超過目標, 調整後重試 ({i}/{max})",
     "log.gray_note": ", 灰階",
     "log.low_quality": "⚠ 為達成目標大小已大幅降低畫質, 內容可能難以閱讀",
+    "perf.label": "效能模式",
+    "perf.eco": "省資源",
+    "perf.balanced": "平衡",
+    "perf.fast": "高速",
+    "perf.hint": "偵測到 {cores} 核心、記憶體 {total} (可用 {avail})。此模式最多同時 {w} 個處理程序平行處理, 額外約用 {mem} 記憶體, 頁數多時較快。",
+    "perf.hint_single": "偵測到 {cores} 核心、記憶體 {total} (可用 {avail})。此模式只用單一處理程序, 最省資源。",
+    "log.parallel": "使用 {w} 個處理程序平行處理",
     "tfirst.switch": "優先達成目標大小",
     "tfirst.hint": "必要時大幅降低畫質並自動轉灰階 (關閉則保留最低畫質)",
     "log.dpi_q": "DPI {dpi}, 品質 {q}",
@@ -341,7 +349,8 @@ DEFAULTS = {
     "theme": "system",
     "language": "",
     "skip_optional_packages": False,
-    "target_first": True,  # language 空字串 = 依系統語言
+    "target_first": True,
+    "perf_mode": "balanced",  # language 空字串 = 依系統語言
     "output_mode": "each",  # each=各自輸出 / merge=合併成一個 / split=拆分頁面
     "split_n": 1,
     "merge_name": "merged",
@@ -648,6 +657,11 @@ HARD_MIN_DPI = 30  # 「優先達成目標」時的解析度下限
 FALLBACK_QUALITY = 35  # 所有階梯都超標時, 最後一階再壓一次用的品質
 SAMPLE_BYTES = 128 * 1024**2  # 抽樣階段最多同時放在記憶體的點陣圖大小
 SAMPLE_MAX_PAGES = 40
+MP_MIN_PAGES = 12  # 頁數少於此值不值得啟動多處理程序 (啟動要約 1 秒)
+WORKER_MEM = (
+    450 * 1024**2
+)  # 估計每個工作程序需要的記憶體 (pdfium + 一頁點陣圖 + 編碼緩衝)
+PERF_MODES = ("eco", "balanced", "fast")
 MAX_ATTEMPTS = 4  # 抽樣估算不準時, 最多修正重試幾次
 # 階梯 = (解析度比例, 品質下限, 品質上限, 是否轉灰階); 先保品質, 保不住才降解析度, 最後才轉灰階
 TIERS_NORMAL = [
@@ -791,6 +805,49 @@ def _fit_a4(w, h):
     return w * s, h * s
 
 
+class _DocCache:
+    """只保留最近使用的一份 PDF: 頁面通常依序處理所以命中率高, 也不會同時開太多檔案。"""
+
+    def __init__(self):
+        self._cur = None
+
+    def get(self, path):
+        if self._cur and self._cur[0] == path:
+            return self._cur[1]
+        self.close()
+        pdf, fh = _open_pdf(path)
+        self._cur = (path, pdf, fh)
+        return pdf
+
+    def close(self):
+        if self._cur:
+            _, pdf, fh = self._cur
+            for c in (pdf, fh):
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            self._cur = None
+
+
+def _render_page(docs, kind, path, idx, size, dpi, gray):
+    """渲染一頁 -> (PIL 圖片, 頁面尺寸 pt)。主程式與多處理程序的工作程序共用。"""
+    if kind == "pdf":
+        page = docs.get(path)[idx]
+        try:
+            bmp = page.render(scale=dpi / 72, grayscale=gray)
+            im = bmp.to_pil().convert("L" if gray else "RGB")
+        finally:
+            page.close()
+        return im, size
+    im = _prepare_image(path, gray)
+    wpt, hpt = _fit_a4(*im.size)
+    tw = max(1, round(wpt / 72 * dpi))
+    if im.width > tw:  # 只縮小, 不放大
+        im = im.resize((tw, max(1, round(im.height * tw / im.width))), Image.LANCZOS)
+    return im, (wpt, hpt)
+
+
 class PageSource:
     """依序提供所有輸出頁面。一次只渲染一頁, 不會把整份文件的點陣圖放進記憶體,
     所以記憶體用量與頁數無關。"""
@@ -798,12 +855,12 @@ class PageSource:
     def __init__(self, items, cancel):
         self.cancel = cancel
         self.pages = []  # (種類, 路徑, 頁索引, 頁面尺寸 pt)
-        self._cur = None  # (路徑, pdf, fh): 只保留最近使用的一份 PDF
+        self._docs = _DocCache()
         try:
             for path, pages in items:
                 name = os.path.basename(path)
                 if is_pdf(path):
-                    pdf = self._doc(path)
+                    pdf = self._docs.get(path)
                     n = len(pdf)
                     if n == 0:
                         raise ValueError(t("err.pdf_no_pages", name=name))
@@ -826,46 +883,12 @@ class PageSource:
             self.close()
             raise
 
-    def _doc(self, path):
-        if self._cur and self._cur[0] == path:
-            return self._cur[1]
-        self._close_cur()
-        pdf, fh = _open_pdf(path)
-        self._cur = (path, pdf, fh)
-        return pdf
-
-    def _close_cur(self):
-        if self._cur:
-            _, pdf, fh = self._cur
-            for c in (pdf, fh):
-                try:
-                    c.close()
-                except Exception:
-                    pass
-            self._cur = None
-
     def close(self):
-        self._close_cur()
+        self._docs.close()
 
     def render(self, i, dpi, gray):
         """渲染第 i 頁, 回傳 (PIL 圖片, 頁面尺寸 pt)。"""
-        kind, path, idx, size = self.pages[i]
-        if kind == "pdf":
-            page = self._doc(path)[idx]
-            try:
-                bmp = page.render(scale=dpi / 72, grayscale=gray)
-                im = bmp.to_pil().convert("L" if gray else "RGB")
-            finally:
-                page.close()
-            return im, size
-        im = _prepare_image(path, gray)
-        wpt, hpt = _fit_a4(*im.size)
-        tw = max(1, round(wpt / 72 * dpi))
-        if im.width > tw:  # 只縮小, 不放大
-            im = im.resize(
-                (tw, max(1, round(im.height * tw / im.width))), Image.LANCZOS
-            )
-        return im, (wpt, hpt)
+        return _render_page(self._docs, *self.pages[i], dpi, gray)
 
     def avg_page_bytes(self, dpi, gray):
         bpp = 1 if gray else 3
@@ -874,8 +897,79 @@ class PageSource:
         ) / len(self.pages)
 
 
-def stream_encode(src, pool, dpi, quality, gray, cancel, prog):
-    """逐頁渲染 -> 平行 JPEG 編碼。記憶體只會同時存在少數幾頁的點陣圖。"""
+_WORKER_DOCS = None
+
+
+def _mp_task(args):
+    """在工作程序中渲染 + JPEG 編碼一頁, 只把壓縮後的位元組傳回主程式 (傳輸量小)。"""
+    global _WORKER_DOCS
+    kind, path, idx, size, dpi, gray, quality = args
+    if _WORKER_DOCS is None:
+        _WORKER_DOCS = _DocCache()
+    im, size_pt = _render_page(_WORKER_DOCS, kind, path, idx, size, dpi, gray)
+    return _encode_jpeg(im, quality), im.size, size_pt
+
+
+class _MPPool:
+    """多處理程序渲染 (pdfium 不是執行緒安全, 要平行就得用多個程序)。延遲建立, 失敗時退回單程序。"""
+
+    def __init__(self, workers):
+        self.workers = workers
+        self.broken = workers <= 1
+        self._ex = None
+
+    def executor(self):
+        if self._ex is None:  # 一律用 spawn: 各系統行為一致, 也是 Windows 唯一的選擇
+            self._ex = ProcessPoolExecutor(
+                max_workers=self.workers,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
+        return self._ex
+
+    def close(self, wait=True):
+        if self._ex is not None:
+            try:
+                self._ex.shutdown(wait=wait, cancel_futures=True)
+            except Exception:
+                pass
+            self._ex = None
+
+
+def _stream_encode_mp(src, mp, dpi, quality, gray, cancel, prog):
+    n = len(src.pages)
+    jpegs, px, sizes = [None] * n, [None] * n, [None] * n
+    ex = mp.executor()
+    pending = collections.deque()
+    nxt = 0
+    for done in range(n):
+        if cancel.is_set():
+            raise Cancelled
+        while (
+            nxt < n and len(pending) < mp.workers * 3
+        ):  # 限制排隊數量, 也讓頁面大致依序處理
+            kind, path, idx, size = src.pages[nxt]
+            pending.append(
+                (nxt, ex.submit(_mp_task, (kind, path, idx, size, dpi, gray, quality)))
+            )
+            nxt += 1
+        i, fut = pending.popleft()
+        jpegs[i], px[i], sizes[i] = fut.result()
+        prog((done + 1) / n)
+    return jpegs, px, sizes
+
+
+def stream_encode(src, pool, dpi, quality, gray, cancel, prog, mp=None):
+    """逐頁渲染 -> JPEG 編碼。記憶體只會同時存在少數幾頁的點陣圖。
+    有 mp 時用多個程序平行渲染 (失敗會自動退回單程序)。"""
+    if mp is not None and not mp.broken:
+        try:
+            return _stream_encode_mp(src, mp, dpi, quality, gray, cancel, prog)
+        except Cancelled:
+            mp.close(wait=False)
+            raise
+        except Exception:
+            mp.broken = True  # 多程序出問題 (例如被防毒擋下), 改回單程序重做
+            mp.close(wait=False)
     n = len(src.pages)
     jpegs, px, sizes = [None] * n, [None] * n, [None] * n
     pending = collections.deque()
@@ -1019,6 +1113,7 @@ def convert(
     target_kb=None,
     gray=False,
     target_first=True,
+    workers=1,
     cancel=None,
     log=print,
     progress=lambda f: None,
@@ -1049,11 +1144,15 @@ def convert(
         return bump
 
     src = PageSource(items, cancel)
+    mp = _MPPool(1)
     try:
         n = len(src.pages)
+        mp = _MPPool(workers if n >= MP_MIN_PAGES else 1)  # 頁數太少不值得啟動多程序
         prog(0.02)
         with ThreadPoolExecutor(WORKERS) as pool:
             if target_kb is None:  # ---- 手動: 固定參數, 逐頁串流 ----
+                if not mp.broken:
+                    log("  " + t("log.parallel", w=mp.workers))
                 jpegs, px, sizes = stream_encode(
                     src,
                     pool,
@@ -1062,6 +1161,7 @@ def convert(
                     gray,
                     cancel,
                     lambda f: prog(0.02 + 0.96 * f),
+                    mp,
                 )
                 final_gray = gray
                 log("  " + t("log.dpi_q", dpi=f"{dpi:.0f}", q=quality))
@@ -1096,6 +1196,8 @@ def convert(
                 else:  # 頁數多: 抽樣估算 -> 逐頁串流 -> 驗證, 必要時修正重試
                     idx = _sample_indices(n, k_max)
                     log("  " + t("log.sampling", n=n, k=len(idx)))
+                    if not mp.broken:
+                        log("  " + t("log.parallel", w=mp.workers))
                     sample = []
                     for j, i in enumerate(idx):
                         if cancel.is_set():
@@ -1121,6 +1223,7 @@ def convert(
                             res["gray"],
                             cancel,
                             lambda f: prog(0.22 + 0.76 * f),
+                            mp,
                         )
                         actual = estimated_pdf_size(jpegs)
                         ok = actual <= budget
@@ -1151,6 +1254,7 @@ def convert(
                 raise Cancelled
             write_pdf(dst, jpegs, px, sizes, final_gray)
     finally:
+        mp.close()
         src.close()
     progress(1.0)
     return os.path.getsize(dst) / 1024
@@ -1203,6 +1307,73 @@ def fmt_size(n_bytes):
         if n_bytes >= 1048576
         else f"{n_bytes / 1024:.0f} KB"
     )
+
+
+# ----------------------------- 系統資源 -----------------------------
+def system_memory():
+    """回傳 (實體記憶體總量, 目前可用量), 單位 bytes; 偵測不到回傳 (None, None)。"""
+    try:
+        if sys.platform.startswith("win"):
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            ms = MEMORYSTATUSEX()
+            ms.dwLength = ctypes.sizeof(ms)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+            return int(ms.ullTotalPhys), int(ms.ullAvailPhys)
+        if sys.platform == "darwin":
+            total = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip())
+            vm = subprocess.check_output(["vm_stat"], text=True)
+            page = int(re.search(r"page size of (\d+)", vm).group(1))
+            pages = sum(
+                int(n)
+                for _, n in re.findall(
+                    r"Pages (free|inactive|speculative):\s+(\d+)", vm
+                )
+            )
+            return total, pages * page
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                info[k] = int(v.split()[0]) * 1024
+        return info["MemTotal"], info.get("MemAvailable", info.get("MemFree"))
+    except Exception:
+        return None, None
+
+
+def plan_workers(mode, cores=None, avail=None):
+    """依效能模式、CPU 核心數與『目前可用記憶體』決定平行處理程序數 (1 = 不使用多程序)。
+    eco: 單程序。balanced: 最多一半核心 (上限 4), 只用可用記憶體的 25%。
+    fast: 保留 1 核心給介面 (上限 16), 最多用可用記憶體的 60%。"""
+    cores = cores or os.cpu_count() or 1
+    if mode not in ("balanced", "fast") or cores < 2:
+        return 1
+    if avail is None:
+        avail = system_memory()[1]
+    frac, cap, by_cores = (
+        (0.25, 4, max(1, cores // 2))
+        if mode == "balanced"
+        else (0.6, 16, max(1, cores - 1))
+    )
+    by_mem = int((avail * frac) // WORKER_MEM) if avail else 2
+    return max(1, min(by_cores, by_mem, cap))
+
+
+def fmt_gb(n_bytes):
+    return "?" if n_bytes is None else f"{n_bytes / 2 ** 30:.1f} GB"
 
 
 # ----------------------------- GUI -----------------------------
@@ -1280,6 +1451,7 @@ class App(ctk.CTk if ctk else object):
         self._refresh_list()
         self._apply_mode()
         self._apply_output_mode()
+        self._apply_perf()
 
     # ---------- 拖曳 ----------
     def _load_dnd(self):
@@ -1525,19 +1697,19 @@ class App(ctk.CTk if ctk else object):
             self.preset_btns.append(b)
 
         self.dpi_var = ctk.IntVar(value=self.cfg["dpi"])
-        self._slider(sf, 10, t("dpi.label"), self.dpi_var, 72, 300)
+        self._slider(sf, 13, t("dpi.label"), self.dpi_var, 72, 300)
         self.q_var = ctk.IntVar(value=self.cfg["quality"])
-        self.q_slider = self._slider(sf, 12, t("quality.label"), self.q_var, 30, 95)
+        self.q_slider = self._slider(sf, 15, t("quality.label"), self.q_var, 30, 95)
 
         self.gray_var = ctk.BooleanVar(value=self.cfg["gray"])
         ctk.CTkSwitch(
             sf, text=t("gray.switch"), variable=self.gray_var, font=F(13)
-        ).grid(row=14, column=0, sticky="w", pady=(6, 6), **P)
+        ).grid(row=17, column=0, sticky="w", pady=(6, 6), **P)
         self.tfirst_var = ctk.BooleanVar(value=self.cfg["target_first"])
         self.tfirst_switch = ctk.CTkSwitch(
             sf, text=t("tfirst.switch"), variable=self.tfirst_var, font=F(13)
         )
-        self.tfirst_switch.grid(row=15, column=0, sticky="w", pady=(4, 0), **P)
+        self.tfirst_switch.grid(row=18, column=0, sticky="w", pady=(4, 0), **P)
         ctk.CTkLabel(
             sf,
             text=t("tfirst.hint"),
@@ -1546,7 +1718,28 @@ class App(ctk.CTk if ctk else object):
             wraplength=300,
             text_color=("gray40", "gray65"),
             anchor="w",
-        ).grid(row=16, column=0, sticky="w", pady=(0, 10), **P)
+        ).grid(row=19, column=0, sticky="w", pady=(0, 10), **P)
+
+        self._label(sf, 10, t("perf.label"))
+        self._perf_rev = {t(f"perf.{k}"): k for k in PERF_MODES}
+        self.perf_seg = ctk.CTkSegmentedButton(
+            sf,
+            values=list(self._perf_rev),
+            font=F(12),
+            command=lambda _=None: self._apply_perf(),
+        )
+        self.perf_seg.set(t(f"perf.{self.cfg['perf_mode']}"))
+        self.perf_seg.grid(row=11, column=0, sticky="ew", pady=(0, 4), **P)
+        self.perf_hint = ctk.CTkLabel(
+            sf,
+            text="",
+            font=F(11),
+            justify="left",
+            wraplength=300,
+            text_color=("gray40", "gray65"),
+            anchor="w",
+        )
+        self.perf_hint.grid(row=12, column=0, sticky="w", pady=(0, 12), **P)
 
         bf = ctk.CTkFrame(rc, fg_color="transparent")
         bf.grid(row=2, column=0, sticky="ew", padx=18, pady=(8, 16))
@@ -1611,6 +1804,21 @@ class App(ctk.CTk if ctk else object):
 
     def _is_auto(self):
         return self.mode_seg.get() == t("cmode.auto")
+
+    def _perf_mode(self):
+        return self._perf_rev.get(self.perf_seg.get(), "balanced")
+
+    def _apply_perf(self):
+        mode = self._perf_mode()
+        w = plan_workers(mode)
+        total, avail = system_memory()
+        info = dict(cores=os.cpu_count() or 1, total=fmt_gb(total), avail=fmt_gb(avail))
+        if w > 1:
+            self.perf_hint.configure(
+                text=t("perf.hint", w=w, mem=fmt_gb(w * WORKER_MEM), **info)
+            )
+        else:
+            self.perf_hint.configure(text=t("perf.hint_single", **info))
 
     def _apply_output_mode(self):
         m = self._output_mode()
@@ -1683,6 +1891,7 @@ class App(ctk.CTk if ctk else object):
             auto=self._is_auto(),
             gray=self.gray_var.get(),
             target_first=self.tfirst_var.get(),
+            perf_mode=self._perf_mode(),
             output_mode=self._output_mode(),
             split_n=split_n,
             merge_name=name,
@@ -1989,6 +2198,7 @@ class App(ctk.CTk if ctk else object):
             target_kb=mb * 1024 if self.cfg["auto"] else None,
             gray=self.cfg["gray"],
             target_first=self.cfg["target_first"],
+            workers=plan_workers(self.cfg["perf_mode"]),
         )
         self.running = True
         self.cancel.clear()
@@ -2084,7 +2294,26 @@ class App(ctk.CTk if ctk else object):
         )
 
 
+def _cli_compress():
+    """python autopdf.py --compress 輸入.pdf 輸出.pdf [--target-mb N] [--workers N]"""
+    a = sys.argv
+    i = a.index("--compress")
+    src, dst = a[i + 1], a[i + 2]
+
+    def opt(name, default):
+        return a[a.index(name) + 1] if name in a else default
+
+    mb = float(opt("--target-mb", 0))
+    kb = compress_pdf(
+        src, dst, target_kb=mb * 1024 if mb else None, workers=int(opt("--workers", 1))
+    )
+    print(f"{dst}: {kb / 1024:.2f} MB")
+
+
 def main():
+    if "--compress" in sys.argv:
+        _cli_compress()
+        return
     if "--list-lang" in sys.argv:  # 診斷: 目前實際載入了哪些語言
         for code, info in I18N_.langs.items():
             src = "bundled" if info.get("bundled") else (info["path"] or "built-in")
@@ -2103,4 +2332,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # 打包成 exe 後, 工作程序啟動時需要這行
     main()

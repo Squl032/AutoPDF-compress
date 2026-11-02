@@ -102,6 +102,13 @@
         "log.low_quality": "⚠ 为达成目标大小已大幅降低画质，内容可能难以阅读",
         "tfirst.switch": "优先达成目标大小",
         "tfirst.hint": "必要时大幅降低画质并自动转灰度 (关闭则保留最低画质)",
-        "run.already_small": "  原文件 ({size}) 已小于目标大小，直接复制，不重新压缩"
+        "run.already_small": "  原文件 ({size}) 已小于目标大小，直接复制，不重新压缩",
+        "perf.label": "性能模式",
+        "perf.eco": "省资源",
+        "perf.balanced": "平衡",
+        "perf.fast": "高速",
+        "perf.hint": "检测到 {cores} 核心、内存 {total} (可用 {avail})。此模式最多同时 {w} 个进程并行处理，额外约占用 {mem} 内存，页数多时更快。",
+        "perf.hint_single": "检测到 {cores} 核心、内存 {total} (可用 {avail})。此模式只用单一进程，最省资源。",
+        "log.parallel": "使用 {w} 个进程并行处理"
     }
 }
