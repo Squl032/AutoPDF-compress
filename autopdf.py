@@ -1,6 +1,7 @@
 """
 AutoPDF-compress (改良版)
 原專案: https://github.com/eason9709/AutoPDF-compress (README 聲明為 MIT 授權)
+授權: 原作者部分為 MIT (LICENSE-MIT); 本專案新增與修改部分為 PolyForm Noncommercial 1.0.0 (LICENSE), 禁止商業用途
 
 功能
 - 壓縮 PDF, 並可把 PNG / JPG / WEBP / BMP / TIFF (以及 HEIC / HEIF, 需 pillow-heif) 轉成 PDF
@@ -109,6 +110,14 @@ DEFAULT_STRINGS = {
     "log.parallel": "使用 {w} 個處理程序平行處理",
     "tfirst.switch": "優先達成目標大小",
     "tfirst.hint": "必要時大幅降低畫質並自動轉灰階 (關閉則保留最低畫質)",
+    "slim.switch": "無損瘦身 (保留文字)",
+    "slim.hint": "不轉成圖片: 保留可選取的文字與向量, 只移除多餘的中繼資料並重新壓縮, 畫質完全不變。檔案不一定能縮到目標大小, 想更小請關閉此項。",
+    "slim.missing": "需要安裝 pikepdf 才能使用: pip install pikepdf",
+    "slim.log": "  無損瘦身 (保留文字, 畫質不變)",
+    "slim.over": "  瘦身後 {size} 仍超過目標大小, 已保留無損結果 (想再縮小請關閉無損瘦身, 改用轉圖片壓縮, 但畫質會下降)",
+    "heavy.switch": "重頁轉圖片",
+    "heavy.hint": "把少數向量資料過重的頁面 (多為複雜圖形) 轉成圖片, 可再省不少空間; 這些頁面的文字無法選取, 其餘頁面不受影響。僅在開啟無損瘦身時有效。",
+    "heavy.log": "  {n} 頁向量資料過重, 已轉成圖片 (省 {size})",
     "log.dpi_q": "DPI {dpi}, 品質 {q}",
     "log.limit_note": " (仍超過目標, 已是極限)",
     "lang.load_failed": "語言檔 {file} 無法讀取: {err}",
@@ -350,6 +359,8 @@ DEFAULTS = {
     "language": "",
     "skip_optional_packages": False,
     "target_first": True,
+    "slim": False,
+    "slim_heavy": True,
     "perf_mode": "balanced",  # language 空字串 = 依系統語言
     "output_mode": "each",  # each=各自輸出 / merge=合併成一個 / split=拆分頁面
     "split_n": 1,
@@ -398,7 +409,11 @@ REQUIRED_PKGS = [
     ("pypdfium2", "pypdfium2"),
     ("PIL", "pillow"),
 ]
-OPTIONAL_PKGS = [("pillow_heif", "pillow-heif"), ("tkinterdnd2", "tkinterdnd2")]
+OPTIONAL_PKGS = [
+    ("pillow_heif", "pillow-heif"),
+    ("tkinterdnd2", "tkinterdnd2"),
+    ("pikepdf", "pikepdf"),
+]
 
 
 def _pkg_missing(pkgs):
@@ -637,6 +652,13 @@ try:  # 選用: 支援 iPhone 的 HEIC / HEIF
 except Exception:
     HEIF_OK = False
 
+try:  # 選用: 保留文字的無損瘦身
+    import pikepdf
+
+    SLIM_OK = True
+except Exception:
+    SLIM_OK = False
+
 try:  # 選用: 拖曳檔案進視窗
     from tkinterdnd2 import DND_FILES, TkinterDnD
 
@@ -663,6 +685,10 @@ WORKER_MEM = (
 )  # 估計每個工作程序需要的記憶體 (pdfium + 一頁點陣圖 + 編碼緩衝)
 PERF_MODES = ("eco", "balanced", "fast")
 MAX_ATTEMPTS = 4  # 抽樣估算不準時, 最多修正重試幾次
+HEAVY_DPI = 110  # 重頁轉圖片: 渲染解析度
+HEAVY_QUALITY = 60  # 重頁轉圖片: JPEG 品質
+HEAVY_MIN_COST = 60 * 1024  # 向量資料低於此大小的頁面不考慮轉圖片 (轉了通常反而更大)
+HEAVY_GAIN = 0.75  # 轉成圖片後要小於原本的這個比例才值得換
 # 階梯 = (解析度比例, 品質下限, 品質上限, 是否轉灰階); 先保品質, 保不住才降解析度, 最後才轉灰階
 TIERS_NORMAL = [
     (1.0, 50, 90, False),
@@ -1260,6 +1286,171 @@ def convert(
     return os.path.getsize(dst) / 1024
 
 
+def _strip_metadata(pdf):
+    """移除所有物件上的 /Metadata (XMP)。有些出版社 PDF 每個物件都附一份, 可佔檔案一半以上。"""
+    n = 0
+    for obj in pdf.objects:
+        try:
+            if pikepdf.Name.Metadata in obj:
+                del obj[pikepdf.Name.Metadata]
+                n += 1
+        except Exception:
+            pass  # 非字典 / 串流的物件
+    return n
+
+
+def _page_costs(pdf):
+    """估每頁的內容 / 影像 / 網格串流位元組 (共用的資源平均分攤, 字型不算)。"""
+    per, users = [], collections.Counter()
+
+    def walk(o, acc, depth=0):
+        if depth > 6:
+            return
+        try:
+            if isinstance(o, pikepdf.Stream):
+                if o.objgen not in acc:
+                    acc[o.objgen] = int(o.get("/Length", 0))
+                    if "/Resources" in o:
+                        walk(o["/Resources"], acc, depth + 1)
+            elif isinstance(o, pikepdf.Dictionary):
+                for k in o.keys():
+                    if k not in ("/Font", "/Parent", "/Annots"):
+                        walk(o[k], acc, depth + 1)
+            elif isinstance(o, pikepdf.Array):
+                for x in o:
+                    walk(x, acc, depth + 1)
+        except Exception:
+            pass  # 讀不出來的物件就不計入
+
+    for page in pdf.pages:
+        acc = {}
+        for key in ("/Contents", "/Resources"):
+            if key in page.obj:
+                walk(page.obj[key], acc)
+        users.update(acc.keys())
+        per.append(acc)
+    return [sum(b / users[k] for k, b in acc.items()) for acc in per]
+
+
+def _rasterize_heavy(src, dst, cancel, progress):
+    """把『向量資料比點陣圖還大』的頁面轉成 JPEG 圖片頁, 其餘頁面維持原樣。
+    回傳 (轉了幾頁, 省下位元組)。"""
+    pdf = pikepdf.open(src)
+    doc = pdfium.PdfDocument(src)
+    try:
+        cost = _page_costs(pdf)
+        cand = [i for i, c in enumerate(cost) if c > HEAVY_MIN_COST]
+        done, saved = 0, 0
+        for j, i in enumerate(cand):
+            if cancel.is_set():
+                raise Cancelled
+            progress(j / len(cand))
+            page = doc[i]
+            w, h = page.get_size()  # 已含旋轉與裁切後的實際顯示尺寸
+            im = page.render(scale=HEAVY_DPI / 72).to_pil().convert("RGB")
+            page.close()
+            data = _encode_jpeg(im, HEAVY_QUALITY)
+            if len(data) >= cost[i] * HEAVY_GAIN:
+                continue
+            img = pikepdf.Stream(pdf, data)
+            img.Type, img.Subtype = pikepdf.Name.XObject, pikepdf.Name.Image
+            img.Width, img.Height = im.size
+            img.ColorSpace = pikepdf.Name.DeviceRGB
+            img.BitsPerComponent = 8
+            img.Filter = pikepdf.Name.DCTDecode
+            obj = pdf.pages[i].obj
+            for k in ("/Rotate", "/CropBox", "/TrimBox", "/BleedBox", "/ArtBox", "/Annots"):
+                if k in obj:
+                    del obj[k]  # 新頁面已是最終外觀, 不需要原本的旋轉 / 裁切 / 連結
+            obj.MediaBox = [0, 0, w, h]
+            obj.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=img))
+            obj.Contents = pikepdf.Stream(pdf, f"q {w:f} 0 0 {h:f} 0 0 cm /Im0 Do Q".encode())
+            done += 1
+            saved += int(cost[i]) - len(data)
+        if done:
+            pdf.remove_unreferenced_resources()
+            pdf.save(
+                dst,
+                compress_streams=True,
+                recompress_flate=True,
+                object_stream_mode=pikepdf.ObjectStreamMode.generate,
+            )
+        return done, saved
+    finally:
+        doc.close()
+        pdf.close()
+
+
+def slim_pdf(
+    items,
+    dst,
+    *,
+    cancel=None,
+    log=print,
+    progress=lambda f: None,
+    heavy=False,
+    **_,
+):
+    """無損瘦身: 不渲染成圖片, 直接改寫 PDF 結構, 文字與向量原封不動。
+    heavy=True 時, 再把少數『向量資料過重』的頁面轉成圖片 (這些頁面文字無法選取)。
+    items 全部要是 PDF; 回傳輸出 KB。"""
+    cancel = cancel or threading.Event()
+
+    def check():
+        if cancel.is_set():
+            raise Cancelled
+
+    tmp, srcs = dst + ".part", []
+    mid = dst + ".slim"  # 重頁轉圖片時, 第一階段瘦身的中間檔
+    try:
+        check()
+        progress(0.05)
+        if len(items) == 1 and items[0][1] is None:
+            out = pikepdf.open(items[0][0])
+            srcs.append(out)
+        else:  # 合併 / 拆分 / 指定頁碼: 把需要的頁面複製到新檔
+            out = pikepdf.new()
+            for path, pages in items:
+                src = pikepdf.open(path)
+                srcs.append(src)
+                for i in range(len(src.pages)) if pages is None else pages:
+                    out.pages.append(src.pages[i])
+                    check()
+        progress(0.3)
+        _strip_metadata(out)
+        out.remove_unreferenced_resources()
+        check()
+        progress(0.5)
+        out.save(
+            mid if heavy else tmp,
+            compress_streams=True,
+            recompress_flate=True,
+            object_stream_mode=pikepdf.ObjectStreamMode.generate,
+            stream_decode_level=pikepdf.StreamDecodeLevel.generalized,
+        )
+        check()
+        if heavy:
+            progress(0.6)
+            n, saved = _rasterize_heavy(
+                mid, tmp, cancel, lambda f: progress(0.6 + 0.38 * f)
+            )
+            if n:
+                log(t("heavy.log", n=n, size=fmt_size(saved)))
+                os.replace(tmp, dst)
+            else:
+                os.replace(mid, dst)
+        else:
+            os.replace(tmp, dst)
+    finally:
+        for p in srcs:
+            p.close()
+        for f in (tmp, mid):
+            if os.path.exists(f):
+                os.remove(f)
+    progress(1.0)
+    return os.path.getsize(dst) / 1024
+
+
 def compress_pdf(src, dst, pages=None, **kw):
     return convert([(src, pages)], dst, **kw)
 
@@ -1720,6 +1911,41 @@ class App(ctk.CTk if ctk else object):
             anchor="w",
         ).grid(row=19, column=0, sticky="w", pady=(0, 10), **P)
 
+        self.slim_var = ctk.BooleanVar(value=self.cfg["slim"] and SLIM_OK)
+        ctk.CTkSwitch(
+            sf,
+            text=t("slim.switch"),
+            variable=self.slim_var,
+            font=F(13),
+            state="normal" if SLIM_OK else "disabled",
+        ).grid(row=20, column=0, sticky="w", pady=(4, 0), **P)
+        ctk.CTkLabel(
+            sf,
+            text=t("slim.hint") if SLIM_OK else t("slim.missing"),
+            font=F(11),
+            justify="left",
+            wraplength=300,
+            text_color=("gray40", "gray65"),
+            anchor="w",
+        ).grid(row=21, column=0, sticky="w", pady=(0, 4), **P)
+        self.heavy_var = ctk.BooleanVar(value=self.cfg["slim_heavy"])
+        ctk.CTkSwitch(
+            sf,
+            text=t("heavy.switch"),
+            variable=self.heavy_var,
+            font=F(13),
+            state="normal" if SLIM_OK else "disabled",
+        ).grid(row=22, column=0, sticky="w", pady=(4, 0), **P)
+        ctk.CTkLabel(
+            sf,
+            text=t("heavy.hint"),
+            font=F(11),
+            justify="left",
+            wraplength=300,
+            text_color=("gray40", "gray65"),
+            anchor="w",
+        ).grid(row=23, column=0, sticky="w", pady=(0, 10), **P)
+
         self._label(sf, 10, t("perf.label"))
         self._perf_rev = {t(f"perf.{k}"): k for k in PERF_MODES}
         self.perf_seg = ctk.CTkSegmentedButton(
@@ -1891,6 +2117,8 @@ class App(ctk.CTk if ctk else object):
             auto=self._is_auto(),
             gray=self.gray_var.get(),
             target_first=self.tfirst_var.get(),
+            slim=self.slim_var.get(),
+            slim_heavy=self.heavy_var.get(),
             perf_mode=self._perf_mode(),
             output_mode=self._output_mode(),
             split_n=split_n,
@@ -2199,6 +2427,8 @@ class App(ctk.CTk if ctk else object):
             gray=self.cfg["gray"],
             target_first=self.cfg["target_first"],
             workers=plan_workers(self.cfg["perf_mode"]),
+            slim=self.cfg["slim"] and SLIM_OK,
+            heavy=self.cfg["slim_heavy"],
         )
         self.running = True
         self.cancel.clear()
@@ -2247,14 +2477,28 @@ class App(ctk.CTk if ctk else object):
                     self.last_out = folder
                     ok += 1
                     continue
-                size_kb = convert(
-                    job["items"],
-                    dst,
-                    cancel=self.cancel,
-                    log=say,
-                    progress=prog,
-                    **opts,
-                )
+                if opts["slim"] and all(is_pdf(p) for p, _ in job["items"]):
+                    say(t("slim.log"))
+                    size_kb = slim_pdf(
+                        job["items"],
+                        dst,
+                        cancel=self.cancel,
+                        log=say,
+                        progress=prog,
+                        heavy=opts["heavy"],
+                    )
+                    if opts["target_kb"] is not None and size_kb > opts["target_kb"]:
+                        # 不自動轉圖片: 那會讓文字變像素, 使用者要的是保留畫質
+                        say(t("slim.over", size=fmt_size(size_kb * 1024)))
+                else:
+                    size_kb = convert(
+                        job["items"],
+                        dst,
+                        cancel=self.cancel,
+                        log=say,
+                        progress=prog,
+                        **{k: v for k, v in opts.items() if k not in ("slim", "heavy")},
+                    )
                 if job["compare"]:
                     before = os.path.getsize(job["src"]) / 1024
                     say(
@@ -2295,7 +2539,11 @@ class App(ctk.CTk if ctk else object):
 
 
 def _cli_compress():
-    """python autopdf.py --compress 輸入.pdf 輸出.pdf [--target-mb N] [--workers N]"""
+    """python autopdf.py --compress 輸入.pdf 輸出.pdf [--target-mb N] [--workers N] [--slim [--heavy]]"""
+    try:  # 管線 / 導向檔案時, Windows 預設編碼印不出中文
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     a = sys.argv
     i = a.index("--compress")
     src, dst = a[i + 1], a[i + 2]
@@ -2304,9 +2552,17 @@ def _cli_compress():
         return a[a.index(name) + 1] if name in a else default
 
     mb = float(opt("--target-mb", 0))
-    kb = compress_pdf(
-        src, dst, target_kb=mb * 1024 if mb else None, workers=int(opt("--workers", 1))
-    )
+    if "--slim" in a:
+        if not SLIM_OK:
+            sys.exit(t("slim.missing"))
+        kb = slim_pdf([(src, None)], dst, log=print, heavy="--heavy" in a)
+    else:
+        kb = compress_pdf(
+            src,
+            dst,
+            target_kb=mb * 1024 if mb else None,
+            workers=int(opt("--workers", 1)),
+        )
     print(f"{dst}: {kb / 1024:.2f} MB")
 
 

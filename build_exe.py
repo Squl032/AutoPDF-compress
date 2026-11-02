@@ -27,6 +27,7 @@ DRY = "--dry-run" in sys.argv  # 只做檢查, 不真的打包
 BUNDLE_OPTIONAL = [
     ("tkinterdnd2", "tkinterdnd2", "拖曳檔案進視窗"),
     ("pillow_heif", "pillow-heif", "HEIC / HEIF 圖片"),
+    ("pikepdf", "pikepdf", "無損瘦身 (保留文字)"),
 ]
 
 
@@ -119,6 +120,7 @@ def main():
         "pypdfium2",
         "pypdfium2_raw",
         "pillow_heif",
+        "pikepdf",
     ):
         if importlib.util.find_spec(mod) is not None:  # 只收集有安裝的 (含資料檔/DLL)
             args += ["--collect-all", mod]

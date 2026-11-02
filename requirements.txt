@@ -3,3 +3,4 @@ pypdfium2
 pillow
 pillow-heif
 tkinterdnd2
+pikepdf
