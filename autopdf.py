@@ -685,6 +685,7 @@ WORKER_MEM = (
 )  # 估計每個工作程序需要的記憶體 (pdfium + 一頁點陣圖 + 編碼緩衝)
 PERF_MODES = ("eco", "balanced", "fast")
 MAX_ATTEMPTS = 4  # 抽樣估算不準時, 最多修正重試幾次
+SAMPLE_MARGIN = 0.87  # 抽樣估算只用目標的這個比例 (實測 8 份書籍有一半第一次偏大 5~8%, 0.93 不夠)
 HEAVY_DPI = 110  # 重頁轉圖片: 渲染解析度
 HEAVY_QUALITY = 60  # 重頁轉圖片: JPEG 品質
 HEAVY_MIN_COST = 60 * 1024  # 向量資料低於此大小的頁面不考慮轉圖片 (轉了通常反而更大)
@@ -1230,7 +1231,7 @@ def convert(
                             raise Cancelled
                         sample.append(src.render(i, dpi, gray)[0])
                         prog(0.02 + 0.10 * (j + 1) / len(idx))
-                    margin = 0.93
+                    margin = SAMPLE_MARGIN
                     for attempt in range(1, MAX_ATTEMPTS + 1):
                         sample_budget = (budget * margin - overhead) * len(idx) / n
                         res = _search(
