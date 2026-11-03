@@ -114,6 +114,7 @@ DEFAULT_STRINGS = {
     "slim.hint": "不轉成圖片: 保留可選取的文字與向量, 只移除多餘的中繼資料並重新壓縮, 畫質完全不變。檔案不一定能縮到目標大小, 想更小請關閉此項。",
     "slim.missing": "需要安裝 pikepdf 才能使用: pip install pikepdf",
     "slim.log": "  無損瘦身 (保留文字, 畫質不變)",
+    "slim.nogain": "  瘦身後沒有變小 (原檔已經很精簡), 已保留原檔",
     "slim.over": "  瘦身後 {size} 仍超過目標大小, 已保留無損結果 (想再縮小請關閉無損瘦身, 改用轉圖片壓縮, 但畫質會下降)",
     "heavy.switch": "重頁轉圖片",
     "heavy.hint": "把少數向量資料過重的頁面 (多為複雜圖形) 轉成圖片, 可再省不少空間; 這些頁面的文字無法選取, 其餘頁面不受影響。僅在開啟無損瘦身時有效。",
@@ -1333,29 +1334,68 @@ def _page_costs(pdf):
     return [sum(b / users[k] for k, b in acc.items()) for acc in per]
 
 
-def _rasterize_heavy(src, dst, cancel, progress):
+def _render_heavy(src, cand, sizes, cancel, workers):
+    """依序產生 (頁索引, JPEG, 像素尺寸, 頁面尺寸 pt)。候選頁夠多就用多程序渲染,
+    多程序出問題時, 剩下的頁面退回單程序。"""
+    done = 0
+    if workers > 1 and len(cand) >= MP_MIN_PAGES:
+        mp = _MPPool(workers)
+        try:
+            ex = mp.executor()
+            pending, nxt = collections.deque(), 0
+            while done < len(cand):
+                if cancel.is_set():
+                    raise Cancelled
+                while nxt < len(cand) and len(pending) < workers * 3:
+                    i = cand[nxt]
+                    task = ("pdf", src, i, sizes[i], HEAVY_DPI, False, HEAVY_QUALITY)
+                    pending.append((i, ex.submit(_mp_task, task)))
+                    nxt += 1
+                i, fut = pending.popleft()
+                yield (i, *fut.result())
+                done += 1
+            return
+        except Cancelled:
+            raise
+        except Exception:
+            pass  # 例如被防毒擋下: 剩下的頁面改用單程序
+        finally:
+            mp.close(wait=False)
+    docs = _DocCache()
+    try:
+        for i in cand[done:]:
+            if cancel.is_set():
+                raise Cancelled
+            im, size = _render_page(docs, "pdf", src, i, sizes[i], HEAVY_DPI, False)
+            yield i, _encode_jpeg(im, HEAVY_QUALITY), im.size, size
+    finally:
+        docs.close()
+
+
+def _rasterize_heavy(src, dst, cancel, progress, workers=1):
     """把『向量資料比點陣圖還大』的頁面轉成 JPEG 圖片頁, 其餘頁面維持原樣。
     回傳 (轉了幾頁, 省下位元組)。"""
     pdf = pikepdf.open(src)
-    doc = pdfium.PdfDocument(src)
     try:
         cost = _page_costs(pdf)
         cand = [i for i, c in enumerate(cost) if c > HEAVY_MIN_COST]
+        if not cand:
+            return 0, 0
+        doc = pdfium.PdfDocument(src)
+        try:
+            sizes = {i: doc[i].get_size() for i in cand}  # 已含旋轉與裁切後的實際顯示尺寸
+        finally:
+            doc.close()
         done, saved = 0, 0
-        for j, i in enumerate(cand):
-            if cancel.is_set():
-                raise Cancelled
+        for j, (i, data, px, (w, h)) in enumerate(
+            _render_heavy(src, cand, sizes, cancel, workers)
+        ):
             progress(j / len(cand))
-            page = doc[i]
-            w, h = page.get_size()  # 已含旋轉與裁切後的實際顯示尺寸
-            im = page.render(scale=HEAVY_DPI / 72).to_pil().convert("RGB")
-            page.close()
-            data = _encode_jpeg(im, HEAVY_QUALITY)
             if len(data) >= cost[i] * HEAVY_GAIN:
                 continue
             img = pikepdf.Stream(pdf, data)
             img.Type, img.Subtype = pikepdf.Name.XObject, pikepdf.Name.Image
-            img.Width, img.Height = im.size
+            img.Width, img.Height = px
             img.ColorSpace = pikepdf.Name.DeviceRGB
             img.BitsPerComponent = 8
             img.Filter = pikepdf.Name.DCTDecode
@@ -1378,7 +1418,6 @@ def _rasterize_heavy(src, dst, cancel, progress):
             )
         return done, saved
     finally:
-        doc.close()
         pdf.close()
 
 
@@ -1390,6 +1429,7 @@ def slim_pdf(
     log=print,
     progress=lambda f: None,
     heavy=False,
+    workers=1,
     **_,
 ):
     """無損瘦身: 不渲染成圖片, 直接改寫 PDF 結構, 文字與向量原封不動。
@@ -1433,7 +1473,7 @@ def slim_pdf(
         if heavy:
             progress(0.6)
             n, saved = _rasterize_heavy(
-                mid, tmp, cancel, lambda f: progress(0.6 + 0.38 * f)
+                mid, tmp, cancel, lambda f: progress(0.6 + 0.38 * f), workers
             )
             if n:
                 log(t("heavy.log", n=n, size=fmt_size(saved)))
@@ -1448,6 +1488,13 @@ def slim_pdf(
         for f in (tmp, mid):
             if os.path.exists(f):
                 os.remove(f)
+    if (
+        len(items) == 1
+        and items[0][1] is None
+        and os.path.getsize(dst) >= os.path.getsize(items[0][0])
+    ):  # 瘦身後沒有比較小 (原檔已經很精簡): 保留原檔, 不要換成更大的
+        shutil.copy2(items[0][0], dst)
+        log(t("slim.nogain"))
     progress(1.0)
     return os.path.getsize(dst) / 1024
 
@@ -2487,6 +2534,7 @@ class App(ctk.CTk if ctk else object):
                         log=say,
                         progress=prog,
                         heavy=opts["heavy"],
+                        workers=opts["workers"],
                     )
                     if opts["target_kb"] is not None and size_kb > opts["target_kb"]:
                         # 不自動轉圖片: 那會讓文字變像素, 使用者要的是保留畫質
@@ -2556,7 +2604,13 @@ def _cli_compress():
     if "--slim" in a:
         if not SLIM_OK:
             sys.exit(t("slim.missing"))
-        kb = slim_pdf([(src, None)], dst, log=print, heavy="--heavy" in a)
+        kb = slim_pdf(
+            [(src, None)],
+            dst,
+            log=print,
+            heavy="--heavy" in a,
+            workers=int(opt("--workers", 1)),
+        )
     else:
         kb = compress_pdf(
             src,

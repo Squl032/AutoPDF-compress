@@ -106,6 +106,7 @@
         "slim.hint": "No rasterizing: keeps selectable text and vectors, only strips redundant metadata and recompresses, so quality is unchanged. The file may not reach the target size; turn this off for smaller files.",
         "slim.missing": "Requires pikepdf: pip install pikepdf",
         "slim.log": "  Lossless slim (text kept, quality unchanged)",
+        "slim.nogain": "  No size reduction (the file is already lean); original kept",
         "slim.over": "  Still {size} after slimming, over the target; lossless result kept (turn off lossless slim to compress as images for a smaller file, at lower quality)",
         "heavy.switch": "Rasterize heavy pages",
         "heavy.hint": "Converts the few pages with very heavy vector data (usually complex graphics) to images for extra savings; text on those pages is no longer selectable, other pages are unaffected. Only applies when lossless slim is on.",
